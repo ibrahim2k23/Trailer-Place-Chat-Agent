@@ -1,4 +1,5 @@
 import os
+import re
 from datetime import datetime
 
 import streamlit as st
@@ -43,15 +44,16 @@ def _env_health() -> tuple[bool, list[str]]:
 
 def _init_state():
     if "messages" not in st.session_state:
-        st.session_state.messages = [
-            {
-                "role": "assistant",
-                "content": "Tell me what kind of trailer you’re looking for (type, budget, hitch, condition, etc.).",
-                "ts": datetime.utcnow().isoformat(),
-            }
-        ]
+        # Start with an empty transcript; we only respond after the user types.
+        st.session_state.messages = []
     if "show_debug" not in st.session_state:
         st.session_state.show_debug = False
+    if "lead" not in st.session_state:
+        st.session_state.lead = {"full_name": None, "phone": None, "email": None}
+    if "lead_captured" not in st.session_state:
+        st.session_state.lead_captured = False
+    if "lead_thanked" not in st.session_state:
+        st.session_state.lead_thanked = False
 
 
 def _history_for_llm():
@@ -63,12 +65,60 @@ def _history_for_llm():
     return out[-12:]  # last 6 turns
 
 
+_LEAD_PATTERNS = {
+    # Capture values even if multiple fields are on the same line.
+    # We stop at the next field label or end-of-string.
+    "full_name": re.compile(
+        r"(?is)\b(?:full\s*name|name)\s*:\s*(.+?)(?=\b(?:phone\s*number|phone|mobile|email)\s*:|$)"
+    ),
+    "phone": re.compile(
+        r"(?is)\b(?:phone\s*number|phone|mobile)\s*:\s*(.+?)(?=\b(?:full\s*name|name|email)\s*:|$)"
+    ),
+    "email": re.compile(
+        r"(?is)\bemail\s*:\s*(.+?)(?=\b(?:full\s*name|name|phone\s*number|phone|mobile)\s*:|$)"
+    ),
+}
+
+
+def _extract_lead_fields(text: str) -> tuple[dict, str]:
+    """
+    Extract lead fields from free text. Returns (fields_found, remaining_text).
+    remaining_text is the original text with any lead lines removed.
+    """
+    raw = (text or "").strip()
+    found: dict = {}
+
+    remaining = raw
+    for key, pat in _LEAD_PATTERNS.items():
+        m = pat.search(raw)
+        if not m:
+            continue
+        val = (m.group(1) or "").strip()
+        if not val:
+            continue
+        found[key] = val
+        # Remove the matched segment from remaining text.
+        remaining = re.sub(re.escape(m.group(0)), " ", remaining, count=1, flags=0)
+
+    # Normalise leftover whitespace/newlines.
+    remaining = " ".join(remaining.split()).strip()
+
+    if "email" in found:
+        found["email"] = found["email"].strip().lower()
+
+    return found, remaining
+
+
+def _lead_is_complete() -> bool:
+    lead = st.session_state.lead or {}
+    return bool((lead.get("full_name") or "").strip()) and bool((lead.get("phone") or "").strip())
+
+
 _init_state()
 
 
 with st.sidebar:
     st.markdown("## Trailer Place")
-    st.caption("Test the recommendation chatbot against Pinecone inventory.")
 
     ok, missing = _env_health()
     if ok:
@@ -84,8 +134,17 @@ with st.sidebar:
     top_k = st.slider("Top K results", min_value=3, max_value=10, value=5, step=1)
 
     st.divider()
+    if st.session_state.lead_captured:
+        st.success("Contact captured.")
+        lead = st.session_state.lead
+        st.caption(f"Name: {lead.get('full_name') or '—'}")
+        st.caption(f"Phone: {lead.get('phone') or '—'}")
+        st.caption(f"Email: {lead.get('email') or '—'}")
+
+
     if st.button("New chat", use_container_width=True):
-        for k in ("messages",):
+        # Reset lead flow fully so thank-you can show again and we never get empty replies.
+        for k in ("messages", "lead", "lead_captured", "lead_thanked"):
             if k in st.session_state:
                 del st.session_state[k]
         st.rerun()
@@ -96,6 +155,7 @@ with st.sidebar:
 
 
 st.markdown("## Trailer Recommendation Chat")
+st.caption("Test the chatbot against your Pinecone inventory.")
 
 
 
@@ -115,34 +175,78 @@ if prompt:
         st.markdown(prompt)
 
     with st.chat_message("assistant"):
-        with st.spinner("Searching inventory…"):
-            try:
-                # Keep bot.TOP_K consistent with sidebar setting for this run
-                bot.TOP_K = int(top_k)
-                logger.info("Chat turn start (top_k=%s)", bot.TOP_K)
+        found, remaining = _extract_lead_fields(prompt)
+        if found:
+            logger.info("Lead fields found: %s", sorted(found.keys()))
+            st.session_state.lead.update({k: v for k, v in found.items() if v})
+        was_captured = bool(st.session_state.lead_captured)
+        st.session_state.lead_captured = _lead_is_complete()
+        just_captured = (not was_captured) and bool(st.session_state.lead_captured)
 
-                openai, index = _get_runtime()
-                result = bot.chat_once(
-                    prompt,
-                    _history_for_llm(),
-                    openai_client=openai,
-                    index=index,
-                    retry_without_filter=True,
-                )
-                # Some model outputs include backticks for emphasis; Streamlit renders
-                # those as inline code (green highlight in dark theme). Strip them.
-                answer = (result["answer"] or "").replace("`", "")
-                logger.info(
-                    "Chat turn complete (matches=%s, retried_unfiltered=%s)",
-                    result.get("match_count"),
-                    result.get("retried_unfiltered"),
-                )
-            except Exception as e:
-                logger.exception("Streamlit chat turn failed")
-                answer = f"Error: {e}"
-                result = {"filters_used": {}, "filter_error": str(e), "match_count": 0}
+        if not st.session_state.lead_captured:
+            logger.info(
+                "Message gated; lead incomplete (have_name=%s have_phone=%s)",
+                bool((st.session_state.lead.get("full_name") or "").strip()),
+                bool((st.session_state.lead.get("phone") or "").strip()),
+            )
+            missing_parts = []
+            if not (st.session_state.lead.get("full_name") or "").strip():
+                missing_parts.append("Full name")
+            if not (st.session_state.lead.get("phone") or "").strip():
+                missing_parts.append("Phone number")
+            msg = "Before we can help with trailer recommendations, please share:\n\n"
+            msg += "\n".join([f"- **{p}:**" for p in missing_parts])
+            msg += "\n- **Email:** (optional)"
+            st.markdown(msg)
+            answer = msg
+            result = {"filters_used": {}, "filter_error": None, "match_count": 0}
+        else:
+            thank_you = "Thank you for contacting Trailer Space. How can we help you today?"
+            show_thank_you = just_captured and (not st.session_state.lead_thanked)
+            if show_thank_you:
+                st.session_state.lead_thanked = True
+                st.markdown(thank_you)
 
-        st.markdown(answer)
+            answer = thank_you if show_thank_you else ""
+            result = {"filters_used": {}, "filter_error": None, "match_count": 0}
+
+            query = (remaining or "").strip()
+            if query:
+                with st.spinner("Searching inventory…"):
+                    try:
+                        bot.TOP_K = int(top_k)
+                        logger.info("Chat turn start (top_k=%s)", bot.TOP_K)
+
+                        openai, index = _get_runtime()
+                        result = bot.chat_once(
+                            query,
+                            _history_for_llm(),
+                            openai_client=openai,
+                            index=index,
+                            retry_without_filter=True,
+                        )
+                        model_answer = (result["answer"] or "").replace("`", "")
+                        logger.info(
+                            "Chat turn complete (matches=%s, retried_unfiltered=%s)",
+                            result.get("match_count"),
+                            result.get("retried_unfiltered"),
+                        )
+                        st.markdown(model_answer)
+                        answer = (thank_you + "\n\n" + model_answer) if show_thank_you else model_answer
+                    except Exception as e:
+                        logger.exception("Streamlit chat turn failed")
+                        err = f"Error: {e}"
+                        st.markdown(err)
+                        answer = (thank_you + "\n\n" + err) if show_thank_you else err
+                        result = {"filters_used": {}, "filter_error": str(e), "match_count": 0}
+
+            if not (remaining or "").strip() and not (answer or "").strip():
+                nudge = (
+                    "How can we help you find the right trailer today? "
+                    "Tell us your budget, trailer type, hitch, size, and condition."
+                )
+                st.markdown(nudge)
+                answer = nudge
 
         if st.session_state.show_debug:
             with st.expander("Debug", expanded=False):
@@ -156,6 +260,8 @@ if prompt:
                 )
                 st.text(result.get("results_text", ""))
 
-    st.session_state.messages.append(
-        {"role": "assistant", "content": answer, "ts": datetime.utcnow().isoformat()}
-    )
+    # Avoid rendering empty assistant bubbles (e.g., lead updates with no query).
+    if (answer or "").strip():
+        st.session_state.messages.append(
+            {"role": "assistant", "content": answer, "ts": datetime.utcnow().isoformat()}
+        )

@@ -98,14 +98,25 @@ Return ONLY the JSON object, no explanation, no markdown fences.
 """
 
 ANSWER_SYSTEM = """\
-You are a friendly and knowledgeable trailer salesperson assistant.
+You are the Trailer Space sales team assistant. Always speak as "we/our" (never "I/me").
+
 You will receive a user's question and a list of matching trailers retrieved from inventory.
-Your job:
-1. Summarise the top matches conversationally — highlight the most relevant specs.
-2. If no trailers were found, apologise and suggest broadening the search.
-3. Keep the response concise but informative (2–4 sentences per trailer).
-4. Always mention price, condition, category, and hitch type if available.
-5. End with a gentle call-to-action (visit the URL or contact the dealer).
+
+Critical rules:
+- Never use negative/apology language such as: "apologize", "sorry", "unfortunately", "unexpectedly", "can't", "cannot".
+- If there are no matches, do not apologise. Instead, just provide alternatives.
+- Do not mention embeddings, Pinecone, vector search, or internal tooling.
+
+Output format:
+- For each trailer, output EXACTLY this block (blank line between trailers):
+
+**Name**: <title>
+**Details**: <2–4 lines, conversational, highlight the most relevant specs for the user's request and also a little bit extra about the trailer; include condition/category/hitch when available>
+**Color**: <color or N/A>
+**Price**: <price formatted like $7,750 or 'Call for pricing' if price is not available or is zero>
+For more information, please visit <url>
+
+- Feel free to visit the links for more details or contact us at (979) 532-1486 if you have any questions
 """
 
 
@@ -214,21 +225,35 @@ def format_results_for_llm(matches: list) -> str:
     if not matches:
         logger.info("Formatting results: no matches")
         return "No matching trailers found."
-    lines = []
+
+    def _truncate(v: object, n: int = 240) -> str:
+        s = "" if v is None else str(v)
+        s = s.replace("\n", " ").strip()
+        return s if len(s) <= n else s[: n - 1] + "…"
+
+    payload = []
     for i, m in enumerate(matches, 1):
-        md = m.metadata
-        line = (
-            f"[{i}] {md.get('title','(no title)')}\n"
-            f"    Make: {md.get('make','?')}  |  Condition: {md.get('condition','?')}\n"
-            f"    Category: {md.get('category_sub','?')}  |  Hitch: {md.get('hitch_type','?')}\n"
-            f"    Color: {md.get('color','?')}  |  Price: ${md.get('price','?')}  |  MSRP: ${md.get('msrp','?')}\n"
-            f"    Length: {md.get('length','?')}  |  GVWR: {md.get('gvwr','?')}\n"
-            f"    URL: {md.get('url','N/A')}\n"
-            f"    Score: {m.score:.3f}"
+        md = getattr(m, "metadata", {}) or {}
+        payload.append(
+            {
+                "rank": i,
+                "title": _truncate(md.get("title") or "(no title)", 200),
+                "url": _truncate(md.get("url") or "N/A", 300),
+                "price": md.get("price"),
+                "msrp": md.get("msrp"),
+                "condition": _truncate(md.get("condition"), 60),
+                "category_sub": _truncate(md.get("category_sub"), 80),
+                "hitch_type": _truncate(md.get("hitch_type"), 60),
+                "color": _truncate(md.get("color"), 60),
+                "length": _truncate(md.get("length"), 60),
+                "gvwr": _truncate(md.get("gvwr"), 60),
+                "make": _truncate(md.get("make"), 80),
+                "score": round(float(getattr(m, "score", 0.0)), 4),
+            }
         )
-        lines.append(line)
-    text = "\n\n".join(lines)
-    logger.debug("Formatted results for LLM (truncated): %s", text[:1000])
+
+    text = json.dumps(payload, ensure_ascii=False, indent=2)
+    logger.debug("Formatted results JSON for LLM (truncated): %s", text[:1200])
     return text
 
 
@@ -259,6 +284,27 @@ def answer_user(user_query: str, results_text: str,
     out = (resp.choices[0].message.content or "").strip()
     logger.info("Answer generation done (len=%s)", len(out))
     logger.debug("Answer (truncated): %s", out[:800])
+
+    # Guardrail: remove common negative/apology phrasing if it slips through.
+    banned = [
+        "unfortunately",
+        "apologize",
+        "apologies",
+        "sorry",
+        "unexpectedly",
+        "i can't",
+        "i cannot",
+        "we can't",
+        "we cannot",
+    ]
+    lowered = out.lower()
+    if any(b in lowered for b in banned):
+        logger.warning("Answer contained banned phrasing; applying light cleanup")
+        for b in banned:
+            # Remove case-insensitively by simple replacements on common forms.
+            out = out.replace(b, "").replace(b.title(), "").replace(b.upper(), "")
+        out = " ".join(out.split())
+
     return out
 
 
