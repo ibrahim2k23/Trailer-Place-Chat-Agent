@@ -31,6 +31,25 @@ from logger_setup import get_logger
 
 logger = get_logger("trailer.chatbot")
 
+
+def phone_for_log(phone: Optional[str]) -> str:
+    """Normalize phone to digits for log lines so the same user is identifiable across formats."""
+    if not phone:
+        return "unknown"
+    digits = "".join(c for c in str(phone).strip() if c.isdigit())
+    return digits if digits else "unknown"
+
+
+def log_chat_exchange(user_phone: Optional[str], user_question: str, assistant_response: str) -> None:
+    """Log one user question and assistant reply, keyed by phone when available."""
+    uid = phone_for_log(user_phone)
+    logger.info(
+        "chat_exchange | user_phone=%s | question=%s | answer=%s",
+        uid,
+        (user_question or "").strip(),
+        (assistant_response or "").strip(),
+    )
+
 try:
     # Optional dependency: allows loading keys from a local `.env` file.
     from dotenv import load_dotenv  # type: ignore
@@ -104,7 +123,14 @@ You will receive a user's question and a list of matching trailers retrieved fro
 
 Critical rules:
 - Never use negative/apology language such as: "apologize", "sorry", "unfortunately", "unexpectedly", "can't", "cannot".
-- If there are no matches, do not apologise. Instead, just provide alternatives.
+- When listing recommendations (matches OR partial matches), the FIRST line of your message must be EXACTLY ONE of the following sentences, with no extra words before or after it:
+    - Based on your preferences, here are some recommendations.
+    - We’ve selected a few recommendations for you.
+    - Take a look at these recommendations.
+    - We suggest the following recommendations for you.
+    - Check out these suggestions we found for you.
+- The FIRST line must be generalized and must NOT mention, restate, or paraphrase any user filters (no "for <...>", no length, no category, no price, no hitch, no color).
+- If there are no matches, do not apologise. Instead, just provide alternative.
 - Do not mention embeddings, Pinecone, vector search, or internal tooling.
 
 Output format:
@@ -118,6 +144,39 @@ For more information, please visit <url>
 
 - Feel free to visit the links for more details or contact us at (979) 532-1486 if you have any questions
 """
+
+_GENERIC_INTROS = (
+    "Based on your preferences, here are some recommendations.",
+    "We’ve selected a few recommendations for you.",
+    "Take a look at these recommendations.",
+    "We suggest the following recommendations for you.",
+    "Check out these suggestions we found for you.",
+)
+
+
+def _enforce_generic_intro(text: str) -> str:
+    """
+    Guarantee a generalized first line that does not echo the user's filters.
+    If the model starts with an allowed intro but appends extra (e.g. "for ..."),
+    we trim it back to the exact allowed sentence.
+    """
+    s = (text or "").lstrip()
+    if not s:
+        return s
+
+    # Work line-wise (Streamlit renders markdown; we want the first visible line stable).
+    lines = s.splitlines()
+    first = (lines[0] or "").strip()
+    rest = "\n".join(lines[1:]).lstrip()
+
+    for intro in _GENERIC_INTROS:
+        if first == intro:
+            return s
+        if first.startswith(intro):
+            # Trim any appended filters/fragments.
+            return (intro + ("\n" + rest if rest else "")).strip()
+
+    return s
 
 
 # ─────────────────────────────────────────────
@@ -282,6 +341,7 @@ def answer_user(user_query: str, results_text: str,
         temperature=0.7,
     )
     out = (resp.choices[0].message.content or "").strip()
+    out = _enforce_generic_intro(out)
     logger.info("Answer generation done (len=%s)", len(out))
     logger.debug("Answer (truncated): %s", out[:800])
 
@@ -454,6 +514,7 @@ def main():
             print(f" → matches={result['match_count']}")
 
         print(f"\nAssistant: {answer}\n")
+        log_chat_exchange(None, user_input, answer)
 
         # Keep multi-turn context (last 6 turns)
         conversation_history.append({"role": "user",      "content": user_input})
