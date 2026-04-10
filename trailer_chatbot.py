@@ -235,9 +235,6 @@ def build_pinecone_filter(f: TrailerFilterQuery) -> Optional[dict]:
     if f.hitch_type:
         clauses.append({"hitch_type": {"$eq": f.hitch_type}})
     if f.category_sub:
-        # Partial match: category_sub might be "Enclosed > Unspecified";
-        # if user says "Enclosed" we do a substring approach via $in would need
-        # exact values. Use $eq on the category portion by normalising.
         clauses.append({"category_sub": {"$eq": f.category_sub}})
     if f.price_min is not None or f.price_max is not None:
         price_clause: dict = {}
