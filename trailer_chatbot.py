@@ -20,6 +20,7 @@ The chatbot:
 
 import json
 import os
+import re
 import sys
 from typing import Optional, Any
 
@@ -176,6 +177,41 @@ def _enforce_generic_intro(text: str) -> str:
             # Trim any appended filters/fragments.
             return (intro + ("\n" + rest if rest else "")).strip()
 
+    return s
+
+
+def _enforce_recommendation_block_format(text: str) -> str:
+    """
+    Normalize recommendation output into the required markdown block structure.
+    This is a safety net when the model returns inline fields in a single paragraph.
+    """
+    s = (text or "").strip()
+    if not s:
+        return s
+
+    # Force field labels onto their own lines and bold the four required labels.
+    label_map = [
+        (r"(?i)\bname\s*:\s*", "**Name**: "),
+        (r"(?i)\bdetails\s*:\s*", "**Details**: "),
+        (r"(?i)\bcolor\s*:\s*", "**Color**: "),
+        (r"(?i)\bprice\s*:\s*", "**Price**: "),
+    ]
+    for pattern, replacement in label_map:
+        s = re.sub(pattern, "\n" + replacement, s)
+
+    s = re.sub(
+        r"(?i)\bfor more information,\s*please visit\s*",
+        "\nFor more information, please visit ",
+        s,
+    )
+
+    # Remove accidental duplicate bolding from repeated normalization.
+    s = s.replace("****Name****:", "**Name**:").replace("****Details****:", "**Details**:")
+    s = s.replace("****Color****:", "**Color**:").replace("****Price****:", "**Price**:")
+
+    # Ensure each trailer starts as its own block.
+    s = re.sub(r"\n(?=\*\*Name\*\*:)", "\n\n", s)
+    s = re.sub(r"\n{3,}", "\n\n", s).strip()
     return s
 
 
@@ -348,6 +384,7 @@ def answer_user(user_query: str, results_text: str,
     )
     out = (resp.choices[0].message.content or "").strip()
     out = _enforce_generic_intro(out)
+    out = _enforce_recommendation_block_format(out)
     logger.info("Answer generation done (len=%s)", len(out))
     logger.debug("Answer (truncated): %s", out[:800])
 
@@ -369,7 +406,10 @@ def answer_user(user_query: str, results_text: str,
         for b in banned:
             # Remove case-insensitively by simple replacements on common forms.
             out = out.replace(b, "").replace(b.title(), "").replace(b.upper(), "")
-        out = " ".join(out.split())
+        # Keep line breaks so markdown block format is preserved.
+        out = re.sub(r"[ \t]+", " ", out)
+        out = re.sub(r"[ \t]*\n[ \t]*", "\n", out).strip()
+        out = _enforce_recommendation_block_format(out)
 
     return out
 
