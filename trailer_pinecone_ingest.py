@@ -64,6 +64,8 @@ class TrailerMetadata(BaseModel):
     condition:        Optional[str]   = None   # "New" | "Pre-Owned"
     price:            Optional[float] = None   # actual sale price
     msrp:             Optional[float] = None   # manufacturer suggested retail
+    category:         Optional[str]   = None   # e.g. "Aluminum"
+    subcategory:      Optional[str]   = None   # e.g. "Livestock"
     category_sub:     Optional[str]   = None   # "Enclosed > Unspecified" etc.
     make:             Optional[str]   = None   # normalised brand
     color:            Optional[str]   = None   # normalised colour
@@ -86,7 +88,7 @@ class TrailerMetadata(BaseModel):
         mapping = {"new": "New", "pre-owned": "Pre-Owned", "used": "Pre-Owned"}
         return mapping.get(v.lower(), v.title())
 
-    @field_validator("color", "hitch_type", "make", mode="before")
+    @field_validator("color", "hitch_type", "make", "category", "subcategory", mode="before")
     @classmethod
     def title_case_str(cls, v):
         if not v or str(v).strip().lower() in ("", "nan", "none"):
@@ -161,6 +163,8 @@ def normalise_row(row: pd.Series) -> dict:
         "condition":    pick("condition"),
         "price":        pick("price"),
         "msrp":         pick("msrp"),
+        "category":     category or None,
+        "subcategory":  subcategory if subcategory and subcategory.lower() != "unspecified" else None,
         "category_sub": category_sub,
         "make":         pick("make"),
         "color":        pick("color"),
@@ -337,6 +341,8 @@ def ingest(file_path: str):
                 "condition":    norm["condition"]    or None,
                 "price":        norm["price"]        or None,
                 "msrp":         norm["msrp"]         or None,
+                "category":     norm["category"]     or None,
+                "subcategory":  norm["subcategory"]  or None,
                 "category_sub": norm["category_sub"] or None,
                 "make":         norm["make"]          or None,
                 "color":        norm["color"]         or None,
