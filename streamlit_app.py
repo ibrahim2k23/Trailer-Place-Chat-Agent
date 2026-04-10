@@ -155,8 +155,6 @@ with st.sidebar:
 
 
 st.markdown("## Trailer Recommendation Chat")
-st.caption("Test the chatbot against your Pinecone inventory.")
-
 
 
 
@@ -247,6 +245,9 @@ if prompt:
                 )
                 st.markdown(nudge)
                 answer = nudge
+
+        if (answer or "").strip():
+            bot.log_chat_exchange(st.session_state.lead.get("phone"), prompt, answer)
 
         if st.session_state.show_debug:
             with st.expander("Debug", expanded=False):
