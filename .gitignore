@@ -1,0 +1,12 @@
+# Virtual environment
+.venv/
+
+# Secrets / local env
+.env
+.env.local
+.env.*.local
+
+# Bytecode
+__pycache__/
+*.py[cod]
+*$py.class
