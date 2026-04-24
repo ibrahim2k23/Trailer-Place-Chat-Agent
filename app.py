@@ -8,6 +8,7 @@ import os
 import secrets
 import time
 import uuid
+from datetime import datetime, timezone
 from concurrent.futures import Future, ThreadPoolExecutor
 
 import streamlit as st
@@ -20,7 +21,11 @@ from src.log_setup import configure_trailerplace_logging
 configure_trailerplace_logging()
 
 from src.agent import TrailerAgent
-from src.conversation_store import enqueue_save_turn, persistence_enabled
+from src.conversation_store import (
+    enqueue_save_turn,
+    enqueue_save_user_feedback,
+    persistence_enabled,
+)
 from src.models import TrailerListing
 from src.thinking_agent import (
     generate_thinking_flow,
@@ -328,7 +333,10 @@ with st.sidebar:
         result = st.session_state.get("last_thinking_result") or {}
         text = (result.get("thinking_markdown") or "").strip()
         if text:
-            with st.expander("Latest turn reasoning", expanded=True):
+            # Avoid st.expander: Material chevron can render as literal "arrow_down" when the
+            # icon font does not load (same issue as feedback popover/expanders in chat).
+            st.caption("Latest turn reasoning")
+            with st.container(border=True):
                 st.markdown(text)
         st.caption("Saved to `thinking_log/YYYY-MM-DD-thinking.log`.")
 
@@ -381,11 +389,73 @@ if not st.session_state.messages:
 </div>
 """, unsafe_allow_html=True)
 else:
-    for msg in st.session_state.messages:
+    for i, msg in enumerate(st.session_state.messages):
         with st.chat_message(msg["role"]):
             st.markdown(msg["content"])
-            for i, listing in enumerate(msg.get("listings") or [], 1):
-                render_card(listing, i)
+            for j, listing in enumerate(msg.get("listings") or [], 1):
+                render_card(listing, j)
+            if msg.get("role") == "assistant":
+                prev_fb = msg.get("user_feedback")
+                if isinstance(prev_fb, dict):
+                    default_txt = (prev_fb.get("text") or "").strip()
+                else:
+                    default_txt = (prev_fb or "") if isinstance(prev_fb, str) else ""
+                # Avoid st.expander / st.popover: they use Material icon fonts; when the font
+                # fails, names like "expand_more" render as text on top of the label.
+                open_key = f"feedback_open_{i}"
+                if not st.session_state.get(open_key, False):
+                    if st.button(
+                        "Optional feedback",
+                        key=f"fb_open_{i}",
+                        use_container_width=True,
+                    ):
+                        st.session_state[open_key] = True
+                        st.rerun()
+                else:
+                    with st.container(border=True):
+                        st.caption("How was this response? (optional — helps us improve.)")
+                        with st.form(f"user_feedback_{i}"):
+                            fb = st.text_area(
+                                "Your notes",
+                                value=default_txt,
+                                height=88,
+                                placeholder="Something off, or what we should do next time…",
+                            )
+                            c1, c2 = st.columns(2)
+                            with c1:
+                                do_save = st.form_submit_button(
+                                    "Save feedback",
+                                    use_container_width=True,
+                                    type="primary",
+                                )
+                            with c2:
+                                do_close = st.form_submit_button(
+                                    "Close", use_container_width=True
+                                )
+                            if do_close:
+                                st.session_state[open_key] = False
+                                st.rerun()
+                            if do_save:
+                                txt = (fb or "").strip()
+                                st.session_state[open_key] = False
+                                st.session_state.messages[i] = {
+                                    **msg,
+                                    "user_feedback": txt or None,
+                                }
+                                if st.session_state.get("chat_session_id") and persistence_enabled():
+                                    t_iso = (
+                                        datetime.now(timezone.utc)
+                                        .replace(microsecond=0)
+                                        .isoformat()
+                                    )
+                                    turn_idx = i // 2
+                                    enqueue_save_user_feedback(
+                                        st.session_state.chat_session_id,
+                                        turn_idx,
+                                        txt,
+                                        t_iso,
+                                    )
+                                st.rerun()
 
 
 # ─────────────────────────────────────────────────────────────
@@ -450,6 +520,7 @@ if prompt := st.chat_input(placeholder):
         "role": "assistant",
         "content": response_text,
         "listings": listings or None,
+        "user_feedback": None,
     })
 
     # 7. Rerun to reset widget state — prevents the "send twice" bug.

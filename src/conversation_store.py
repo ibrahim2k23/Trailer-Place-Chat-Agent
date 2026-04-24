@@ -171,3 +171,136 @@ def enqueue_save_turn(
     if not session_id or not persistence_enabled():
         return
     _pool.submit(save_turn, session_id, user_text, assistant_text, tool_call, tool_result, search_runs)
+
+
+def get_messages_for_session(session_id: str) -> Optional[list]:
+    eng = get_engine()
+    if eng is None:
+        return None
+    try:
+        with eng.connect() as conn:
+            row = conn.execute(
+                text(
+                    "SELECT messages FROM conversation_history "
+                    "WHERE session_id = CAST(:sid AS uuid) LIMIT 1"
+                ),
+                {"sid": session_id},
+            ).mappings().first()
+            if not row or row.get("messages") is None:
+                return None
+            m = row["messages"]
+            if isinstance(m, list):
+                return m
+            if isinstance(m, str):
+                return json.loads(m)
+            return list(m) if m is not None else None
+    except Exception:
+        logger.exception("get_messages_for_session failed (session_id=%s)", session_id)
+        return None
+
+
+def _patch_turn_feedback(
+    session_id: str, turn_index: int, feedback_text: str, feedback_at: str
+) -> None:
+    eng = get_engine()
+    if eng is None:
+        return
+    with eng.connect() as conn:
+        row = conn.execute(
+            text(
+                "SELECT messages FROM conversation_history "
+                "WHERE session_id = CAST(:sid AS uuid) LIMIT 1"
+            ),
+            {"sid": session_id},
+        ).mappings().first()
+        if not row:
+            logger.warning("patch_turn_feedback: no row for session_id=%s", session_id)
+            return
+        messages = row["messages"]
+        if isinstance(messages, str):
+            messages = json.loads(messages)
+        if not isinstance(messages, list) or turn_index < 0 or turn_index >= len(messages):
+            logger.warning(
+                "patch_turn_feedback: bad turn_index %s (len=%s) session_id=%s",
+                turn_index,
+                len(messages) if isinstance(messages, list) else "?",
+                session_id,
+            )
+            return
+        turn = messages[turn_index]
+        if not isinstance(turn, dict):
+            return
+        if feedback_text:
+            turn["user_feedback"] = {"text": feedback_text, "at": feedback_at}
+        else:
+            turn.pop("user_feedback", None)
+        messages_json = json.dumps(messages, ensure_ascii=False)
+        if feedback_text:
+            log_entry = {
+                "turn_index": turn_index,
+                "text": feedback_text,
+                "at": feedback_at,
+            }
+            log_json = json.dumps([log_entry], ensure_ascii=False)
+            try:
+                conn.execute(
+                    text(
+                        """
+                        UPDATE conversation_history
+                        SET messages = CAST(:messages AS jsonb),
+                            response_feedback = COALESCE(response_feedback, '[]'::jsonb)
+                                || CAST(:add AS jsonb),
+                            updated_at = now()
+                        WHERE session_id = CAST(:sid AS uuid)
+                        """
+                    ),
+                    {"messages": messages_json, "add": log_json, "sid": session_id},
+                )
+            except Exception:
+                conn.rollback()
+                conn.execute(
+                    text(
+                        """
+                        UPDATE conversation_history
+                        SET messages = CAST(:messages AS jsonb),
+                            updated_at = now()
+                        WHERE session_id = CAST(:sid AS uuid)
+                        """
+                    ),
+                    {"messages": messages_json, "sid": session_id},
+                )
+        else:
+            conn.execute(
+                text(
+                    """
+                    UPDATE conversation_history
+                    SET messages = CAST(:messages AS jsonb), updated_at = now()
+                    WHERE session_id = CAST(:sid AS uuid)
+                    """
+                ),
+                {"messages": messages_json, "sid": session_id},
+            )
+        conn.commit()
+
+
+def save_user_feedback(
+    session_id: str, turn_index: int, feedback_text: str, feedback_at: str
+) -> None:
+    if not session_id or not persistence_enabled():
+        return
+    try:
+        _patch_turn_feedback(
+            session_id, turn_index, (feedback_text or "").strip(), feedback_at
+        )
+    except Exception:
+        logger.exception("save_user_feedback failed (session_id=%s turn=%s)", session_id, turn_index)
+
+
+def enqueue_save_user_feedback(
+    session_id: str, turn_index: int, feedback_text: str, feedback_at: str
+) -> None:
+    if not session_id or not persistence_enabled():
+        return
+    _pool.submit(
+        save_user_feedback, session_id, turn_index, feedback_text, feedback_at
+    )
