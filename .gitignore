@@ -15,3 +15,5 @@ __pycache__/
 *$py.class
 
 .claude/
+
+thinking_log/
