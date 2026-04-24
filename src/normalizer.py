@@ -50,7 +50,12 @@ MAKE_MAP = {
 
 HITCH_MAP = {
     "bumper pull": "Bumper Pull",
+    "bumper-pull": "Bumper Pull",
     "gooseneck": "Gooseneck",
+    "goose neck": "Gooseneck",
+    "goose-neck": "Gooseneck",
+    "tag along": "Bumper Pull",
+    "tag-along": "Bumper Pull",
 }
 
 # Dealer contact noise patterns
@@ -137,7 +142,14 @@ def clean_dealer_notes(notes: Optional[str]) -> str:
     return text[:800]
 
 
+def _info_without_excluded_for_embedding(info: dict) -> dict:
+    """Drop keys that should not affect vector text (e.g. MSRP)."""
+    excl = {"msrp"}
+    return {k: v for k, v in (info or {}).items() if str(k).lower() not in excl}
+
+
 def build_embedding_text(info: dict, title: str, dealer_notes: Optional[str]) -> str:
+    info = _info_without_excluded_for_embedding(info)
     parts = [title]
 
     fields = [

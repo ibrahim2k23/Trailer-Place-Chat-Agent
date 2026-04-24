@@ -17,6 +17,14 @@ class TrailerFilter(BaseModel):
     make: Optional[str] = Field(None, description="Trailer manufacturer brand")
     color: Optional[str] = Field(None, description="Trailer color")
     hitch_type: Optional[str] = Field(None, description="'Bumper Pull' or 'Gooseneck'")
+    required_length_ft: Optional[float] = Field(
+        None,
+        description="Minimum trailer deck length in feet (numeric filter threshold)",
+    )
+    required_gvwr_lbs: Optional[float] = Field(
+        None,
+        description="Minimum trailer GVWR in lbs (numeric filter threshold)",
+    )
 
 
 class TrailerListing(BaseModel):

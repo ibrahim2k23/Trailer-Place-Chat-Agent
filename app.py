@@ -6,19 +6,34 @@ Run:
 """
 import os
 import secrets
+import time
+import uuid
+from concurrent.futures import Future, ThreadPoolExecutor
 
 import streamlit as st
 import streamlit.components.v1 as components
 from dotenv import load_dotenv
 
-from src.agent import TrailerAgent
-from src.models import TrailerListing
-
 load_dotenv()
+from src.log_setup import configure_trailerplace_logging
+
+configure_trailerplace_logging()
+
+from src.agent import TrailerAgent
+from src.conversation_store import enqueue_save_turn, persistence_enabled
+from src.models import TrailerListing
+from src.thinking_agent import (
+    generate_thinking_flow,
+    log_thinking_flow,
+    thinking_agent_background,
+    thinking_agent_enabled,
+)
 
 _AUTH_USER = (os.getenv("TRAILERPLACE_APP_USERNAME") or "").strip()
 _AUTH_PASS = (os.getenv("TRAILERPLACE_APP_PASSWORD") or "").strip()
 _AUTH_CONFIGURED = bool(_AUTH_USER and _AUTH_PASS)
+_THINKING_EXECUTOR = ThreadPoolExecutor(max_workers=2, thread_name_prefix="tp_thinking")
+_THINKING_POLL_MS = int((os.getenv("THINKING_AGENT_POLL_MS") or "700").strip())
 
 
 def _password_matches(got: str, expected: str) -> bool:
@@ -26,6 +41,12 @@ def _password_matches(got: str, expected: str) -> bool:
     if len(ga) != len(ea):
         return False
     return secrets.compare_digest(ga, ea)
+
+
+def _run_thinking_job(session_id: str, payload: dict) -> dict:
+    result = generate_thinking_flow(payload)
+    log_thinking_flow(session_id, payload, result)
+    return result
 
 
 st.set_page_config(
@@ -139,6 +160,14 @@ components.html("""
 # ─────────────────────────────────────────────────────────────
 # TRAILER CARD — inline styles only, no class dependencies
 # ─────────────────────────────────────────────────────────────
+def _format_type_for_card(category_subcategory: str) -> str:
+    """Storage may be 'Category > Subcategory'; the card shows only the main category."""
+    s = (category_subcategory or "").strip()
+    if not s:
+        return s
+    return s.split(" > ")[0].strip()
+
+
 def render_card(listing: TrailerListing, rank: int):
     price_str = (
         listing.price_display
@@ -150,7 +179,7 @@ def render_card(listing: TrailerListing, rank: int):
     specs = [
         ("Make",     listing.make),
         ("Year",     listing.year),
-        ("Type",     listing.category_subcategory),
+        ("Type",     _format_type_for_card(listing.category_subcategory)),
         ("Hitch",    listing.hitch_type),
         ("Color",    listing.color),
         ("Length",   listing.length),
@@ -238,8 +267,40 @@ if not st.session_state.auth_ok:
     st.stop()
 
 
+if "chat_session_id" not in st.session_state:
+    st.session_state.chat_session_id = str(uuid.uuid4())
 if "agent" not in st.session_state:
     st.session_state.agent = TrailerAgent()
+if "last_thinking_result" not in st.session_state:
+    st.session_state.last_thinking_result = None
+if "thinking_status" not in st.session_state:
+    st.session_state.thinking_status = "idle"
+if "thinking_future" not in st.session_state:
+    st.session_state.thinking_future = None
+if "last_thinking_payload" not in st.session_state:
+    st.session_state.last_thinking_payload = None
+
+thinking_future = st.session_state.get("thinking_future")
+if isinstance(thinking_future, Future) and thinking_future.done():
+    try:
+        st.session_state.last_thinking_result = thinking_future.result()
+        st.session_state.thinking_status = "done"
+    except Exception as exc:
+        st.session_state.last_thinking_result = {
+            "status": "error",
+            "error": str(exc),
+            "thinking_markdown": "",
+        }
+        st.session_state.thinking_status = "error"
+    st.session_state.thinking_future = None
+elif (
+    isinstance(thinking_future, Future)
+    and st.session_state.get("thinking_status") == "pending"
+):
+    # Auto-refresh while background thinking generation is running so the
+    # result appears without requiring the user to send another message.
+    time.sleep(max(0.2, _THINKING_POLL_MS / 1000.0))
+    st.rerun()
 
 
 # ─────────────────────────────────────────────────────────────
@@ -254,15 +315,46 @@ with st.sidebar:
     st.markdown("💳 Financing available")
     st.markdown("🚚 Delivery available")
     st.divider()
+    st.markdown("### Thinking Flow")
+    if not thinking_agent_enabled():
+        st.caption("Thinking agent is disabled (`THINKING_AGENT_ENABLED=0`).")
+    else:
+        status = st.session_state.get("thinking_status", "idle")
+        if status == "pending":
+            st.caption("Generating thinking flow in background...")
+        elif status == "error":
+            err = (st.session_state.get("last_thinking_result") or {}).get("error", "unknown error")
+            st.caption(f"Thinking flow failed: {err}")
+        result = st.session_state.get("last_thinking_result") or {}
+        text = (result.get("thinking_markdown") or "").strip()
+        if text:
+            with st.expander("Latest turn reasoning", expanded=True):
+                st.markdown(text)
+        st.caption("Saved to `thinking_log/YYYY-MM-DD-thinking.log`.")
+
     if st.button("↺  New Conversation", use_container_width=True):
         st.session_state.agent = TrailerAgent()
         st.session_state.messages = []
+        st.session_state.chat_session_id = str(uuid.uuid4())
+        st.session_state.last_thinking_result = None
+        st.session_state.thinking_status = "idle"
+        st.session_state.thinking_future = None
+        st.session_state.last_thinking_payload = None
         st.rerun()
     if st.button("Log out", use_container_width=True):
         st.session_state.auth_ok = False
         if "agent" in st.session_state:
             del st.session_state.agent
         st.session_state.messages = []
+        for k in (
+            "chat_session_id",
+            "last_thinking_result",
+            "thinking_status",
+            "thinking_future",
+            "last_thinking_payload",
+        ):
+            if k in st.session_state:
+                del st.session_state[k]
         st.rerun()
 
 
@@ -315,18 +407,51 @@ if prompt := st.chat_input(placeholder):
     # 3. Get response — spinner is visible while user bubble is already on screen
     with st.chat_message("assistant"):
         with st.spinner(""):
-            response_text, listings = st.session_state.agent.chat(prompt)
+            response_text, listings, product_fetch, thinking_context = st.session_state.agent.chat(prompt)
         st.markdown(response_text)
         for i, listing in enumerate(listings or [], 1):
             render_card(listing, i)
 
-    # 4. Persist response
+    # 4. Thinking flow generation (background by default)
+    if thinking_agent_enabled() and thinking_context is not None:
+        st.session_state.last_thinking_payload = thinking_context
+        if thinking_agent_background():
+            st.session_state.thinking_status = "pending"
+            st.session_state.thinking_future = _THINKING_EXECUTOR.submit(
+                _run_thinking_job,
+                st.session_state.chat_session_id,
+                thinking_context,
+            )
+        else:
+            result = _run_thinking_job(st.session_state.chat_session_id, thinking_context)
+            st.session_state.last_thinking_result = result
+            st.session_state.thinking_status = "done" if result.get("status") == "ok" else "error"
+            st.session_state.thinking_future = None
+
+    # 5. Async persist to Supabase (non-blocking)
+    if persistence_enabled() and st.session_state.get("chat_session_id"):
+        tool_call_db = None
+        tool_res_db = None
+        if product_fetch:
+            last = product_fetch[-1]
+            tool_res_db = last.get("recommendation_payload")
+            tool_call_db = {k: v for k, v in last.items() if k != "recommendation_payload"}
+        enqueue_save_turn(
+            st.session_state.chat_session_id,
+            prompt,
+            response_text,
+            tool_call_db,
+            tool_res_db,
+            search_runs=product_fetch if product_fetch else None,
+        )
+
+    # 6. Persist response
     st.session_state.messages.append({
         "role": "assistant",
         "content": response_text,
         "listings": listings or None,
     })
 
-    # 5. Rerun to reset widget state — prevents the "send twice" bug.
+    # 7. Rerun to reset widget state — prevents the "send twice" bug.
     #    Content is already rendered above so the rerun re-draws from history seamlessly.
     st.rerun()

@@ -80,6 +80,17 @@ OPENAI_MODEL=gpt-4o-mini
 OPENAI_EMBEDDING_MODEL=text-embedding-3-small
 ```
 
+## Logging
+- **Console** + **daily file** under `log/YYYY-MM-DD.log` (project root: same folder as `app.py`). Override directory with `TRAILERPLACE_LOG_DIR`.
+- **Product fetch (Pinecone):** logger `trailerplace.product_fetch` — one JSON line per query attempt (strict/relaxed) with `query`, `pinecone_filter`, `match_count`, and short `matches` (id, score, title, url). Console uses the same format as other log lines.
+- The Streamlit sidebar can show **“Show product fetch debug”** for the last turn’s fetch payload (`st.json`).
+
+## Supabase / conversation history
+- One-time: run [`supabase_conversation_history.sql`](supabase_conversation_history.sql) in the Supabase SQL editor.
+- **Connection:** set `DATABASE_URL` (preferred), e.g. `postgresql+psycopg://USER:PASSWORD@HOST:5432/postgres?sslmode=require`, or `SUPABASE_DB_HOST`, `SUPABASE_DB_USER`, `SUPABASE_DB_PASSWORD`, `SUPABASE_DB_PORT` (default `5432`), `SUPABASE_DB_NAME` (default `postgres`). Do not commit credentials.
+- **Disable writes:** `TRAILERPLACE_PERSIST_CHATS=0`.
+- Each chat session has a `chat_session_id` (UUID); each user turn is appended to `conversation_history.messages` in the background. `tool_call` / `tool_call_result` store the latest search’s filter metadata and recommended rows.
+
 ## Re-indexing
 ```bash
 # Force re-index (e.g. after data changes)

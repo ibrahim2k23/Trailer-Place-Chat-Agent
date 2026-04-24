@@ -257,10 +257,6 @@ def _build_pinecone_filter(f: TrailerFilter) -> Optional[dict]:
         normalized = normalize_hitch(f.hitch_type)
         if normalized:
             pf["hitch_type"] = {"$eq": normalized}
-    if f.required_length_ft is not None:
-        pf["length_ft_num"] = {"$gte": f.required_length_ft}
-    if f.required_gvwr_lbs is not None:
-        pf["gvwr_lbs_num"] = {"$gte": f.required_gvwr_lbs}
 
     if f.make:
         normalized = normalize_make(f.make)
@@ -498,67 +494,6 @@ def _extract_length_ft_from_text(text: str) -> Optional[float]:
     return None
 
 
-def _spec_str_nonempty(val) -> bool:
-    """True if listing spec string looks present (for ranking, not display)."""
-    if val is None:
-        return False
-    s = str(val).strip()
-    if not s:
-        return False
-    low = s.lower()
-    if low in ("unknown", "n/a", "na", "-", "--", "tbd"):
-        return False
-    return True
-
-
-def _infer_hitch_type_from_text(text: str) -> Optional[str]:
-    """
-    If user text clearly prefers one hitch type, return 'Gooseneck' or 'Bumper Pull'.
-    If both or neither are indicated, return None. (Conservative: avoids wrong filters.)
-    """
-    if not (text or "").strip():
-        return None
-    t = text.lower()
-    has_gooseneck = bool(
-        re.search(
-            r"\bgooseneck\b|goose[\s\-]+neck|gooseneck\s+hitch|"
-            r"\bgn\s+(?:hitch|trailer)\b|with\s+a\s+gooseneck",
-            t,
-        )
-    )
-    has_bumper = bool(
-        re.search(
-            r"bumper\s*pull|bumper-pull|\btag[\s\-]*along\b|"
-            r"\b(?:a\s+)?bumper\s+hitch\b|pull[-\s]?behind|tow\s+behind",
-            t,
-        )
-    )
-    if has_gooseneck and has_bumper:
-        return None
-    if has_gooseneck:
-        return "Gooseneck"
-    if has_bumper:
-        return "Bumper Pull"
-    return None
-
-
-def _is_clear_light_cargo_text(text: str) -> bool:
-    if not (text or "").strip():
-        return False
-    t = text.lower()
-    patterns = (
-        r"\bgolf[\s\-]*cart(?:s)?\b",
-        r"\batv(?:s)?\b",
-        r"\butv(?:s)?\b",
-        r"\blawn(?:\s+equipment|\s+tools?)\b",
-        r"\bgarden(?:ing)?\s+tools?\b",
-        r"\bpush\s+mower(?:s)?\b",
-        r"\bsmall\s+equipment\b",
-        r"\blight\s+cargo\b",
-    )
-    return any(re.search(p, t) for p in patterns)
-
-
 def _coerce_required_payload_lbs(val) -> Optional[float]:
     numeric = _coerce_positive_float(val)
     if numeric is not None:
@@ -668,13 +603,7 @@ SEARCH_TOOL = {
                 "hitch_type": {
                     "type": "string",
                     "enum": ["Bumper Pull", "Gooseneck"],
-                    "description": (
-                        "REQUIRED for Pinecone filtering whenever the customer clearly wants "
-                        "a Bumper Pull or Gooseneck hitch (or common aliases: goose neck, tag along). "
-                        "The word 'Gooseneck' in listing titles is often a brand, not a hitch: when the user "
-                        "wants a gooseneck *hitch*, you MUST still set this to 'Gooseneck'. "
-                        "Omit only if they express no hitch preference."
-                    ),
+                    "description": "Hitch type, only if customer specifies",
                 },
                 "required_payload_lbs": {
                     "type": "number",
@@ -688,13 +617,6 @@ SEARCH_TOOL = {
                     "description": (
                         "Required haul/load length in feet when the customer clearly provides it "
                         "(for fit-aware ranking). Omit if unknown."
-                    ),
-                },
-                "required_gvwr_lbs": {
-                    "type": "number",
-                    "description": (
-                        "Minimum trailer GVWR in lbs when the customer clearly provides it "
-                        "(for fit-aware filtering/ranking). Omit if unknown."
                     ),
                 },
             },
@@ -747,33 +669,32 @@ Map what the customer says to a category. Critical disambiguation rules:
 ## QUALIFICATION — COLLECT THESE SLOTS BEFORE CALLING search_trailers
 Ask ONE question at a time, in order. Stop collecting once you have the required slots.
 
-VERY IMPORTANT NOTE:  if the user clearly says light items (e.g. golf cart, ATVs, gardening/lawn tools, small equipment) and do not provide weight, skip the weight follow-up and proceed to search with `required_payload_lbs=1000`. YOu don't even need to confirm the weight with the user.
-
-**Equipment:** haul_item → haul_weight_lbs(only ask if haul item is not light items etc.) → haul_length_ft· optional: hitch preference, loading style (ramps / deckover / drive-over fenders)
-**Car Hauler:** vehicle_type → haul_weight_lbs(only ask if haul item is not light items etc.) → vehicle_length_ft · optional: open vs. covered
-**Utility:** haul_item → haul_weight_lbs(only ask if haul item is not light items etc.) · optional: size, sides / gate / tool storage
-**Dump:** haul_material → haul_weight_lbs(only ask if haul item is not light items etc.) · optional: dump mechanism (scissor / telescopic / standard)
-**Tilt:** haul_item → haul_weight_lbs(only ask if haul item is not light items etc.) · optional: full tilt vs. stationary front deck
-**Enclosed:** use_case → cargo_size · optional: AC / windows / cabinets / finished interior
-**Livestock:** animal_type → animal_count · optional: length, gate preferences (butterfly / swing / slant)
-**Roll Off:** package_scope (trailer / bins / both) → bin_size · optional: step deck vs. standard, CDL concern
-**Diesel Tank:** fuel_type (diesel / gasoline) → tank_capacity · optional: step deck vs. standard, CDL concern
-**Flatbed:** haul_item → haul_weight_lbs(only ask if haul item is not light items etc.) · optional: step deck vs. standard, CDL concern
-**Fiber:** use_case (splicing / office / cooldown) · optional: crew size, AC / workbench / generator
-**Race Trailer:** vehicle_type → trailer_length_ft · optional: cabinets / workspace / living quarters
-**Welding:** equipment_list · optional: total weight
-**Aluminum (modifier):** resolve base_category first → payload_need · optional: sleeping need
-**Offroad:** use_case (camping / overlanding / gear hauling) · optional: sleeping need
+**Equipment:** haul_item → haul_weight_lbs → haul_length_ft → tow_vehicle · optional: hitch preference, loading style (ramps / deckover / drive-over fenders)
+**Car Hauler:** vehicle_type → haul_weight_lbs → vehicle_length_ft → tow_vehicle · optional: open vs. covered
+**Utility:** haul_item → haul_weight_lbs → tow_vehicle · optional: size, sides / gate / tool storage
+**Dump:** haul_material → haul_weight_lbs → tow_vehicle · optional: dump mechanism (scissor / telescopic / standard)
+**Tilt:** haul_item → haul_weight_lbs → tow_vehicle · optional: full tilt vs. stationary front deck
+**Enclosed:** use_case → cargo_size → tow_vehicle · optional: AC / windows / cabinets / finished interior
+**Livestock:** animal_type → animal_count → tow_vehicle · optional: length, gate preferences (butterfly / swing / slant)
+**Roll Off:** package_scope (trailer / bins / both) → bin_size → tow_vehicle
+**Diesel Tank:** fuel_type (diesel / gasoline) → tank_capacity → tow_vehicle
+**Flatbed:** haul_item → haul_weight_lbs → tow_vehicle · optional: step deck vs. standard, CDL concern
+**Fiber:** use_case (splicing / office / cooldown) → tow_vehicle · optional: crew size, AC / workbench / generator
+**Race Trailer:** vehicle_type → trailer_length_ft → tow_vehicle · optional: cabinets / workspace / living quarters
+**Welding:** equipment_list → tow_vehicle · optional: total weight
+**Aluminum (modifier):** resolve base_category first → payload_need → tow_vehicle
+**Offroad:** use_case (camping / overlanding / gear hauling) → tow_vehicle · optional: sleeping need
 
 Recovery rules — when a customer doesn't know a slot:
+- Weight unknown → "If you know the make and model of what you're hauling, I can usually work from that."
 - Size unknown → "Even a rough estimate helps — about how long is it?"
+- Tow vehicle unknown → "Even a rough answer works — are you towing with an SUV, half-ton, three-quarter-ton, or one-ton?"
 
 ## SEARCHING & RECOMMENDATIONS
 Once required slots are filled, call search_trailers immediately with a rich query. After results come back:
-- Open with a short recap of what they asked for (category, haul, rough weight etc.), then introduce the options.
-- **Hitch type and Pinecone:** The vector database filters on structured fields. If the customer clearly wants a **Bumper Pull** or **Gooseneck** hitch (or phrasing like *gooseneck hitch*, *goose neck*, *bumper pull*, *tag along*), you MUST set tool arg **`hitch_type`** to **`"Bumper Pull"`** or **`"Gooseneck"`** — the free-text `query` alone is not enough. **Brand vs hitch:** the word *Gooseneck* in a model name (e.g. a manufacturer) is not a hitch; when the customer is asking for a *gooseneck hitch* / *gooseneck* in a hitch context, they mean **`hitch_type: "Gooseneck"`**.
-- If customer clearly states the load weight, load length, or a minimum trailer GVWR, you MUST pass them in tool args (`required_payload_lbs`, `required_length_ft`, `required_gvwr_lbs`) as numeric values so recommendation ranking can prefer right-sized trailers.
-- Normalize units before tool args: convert any weight units (tons, kg, etc.) to **lbs** for `required_payload_lbs` and `required_gvwr_lbs`, and convert any length units (m/cm/mm/yd/in) to **feet** for `required_length_ft`.
+- Open with a short recap of what they asked for (category, haul, rough weight, tow vehicle, etc.), then introduce the options.
+- If customer clearly states the load weight or load length, you MUST pass them in tool args (`required_payload_lbs`, `required_length_ft`) as numeric values so recommendation ranking can prefer right-sized trailers.
+- Normalize units before tool args: convert any weight units (tons, kg, etc.) to **lbs** for `required_payload_lbs`, and convert any length units (m/cm/mm/yd/in) to **feet** for `required_length_ft`.
 - When you present **multiple** trailers, number them **`1.`**, **`2.`**, **`3.`** (etc.) in the order you want them read. For a **single** trailer, you may omit the number.
 - For **each** trailer, use this **fixed layout** — do not skip or reorder steps **2** and **3**:
   1) **Title line** — Markdown link: **`[Full listing title exactly as returned — includes stock after the dash](that row's listing URL from search JSON)`**. Use the **per-listing URL** from the tool for that trailer (not the generic dealership site URL unless it is the same field).
@@ -791,7 +712,7 @@ Once required slots are filled, call search_trailers immediately with a rich que
 •Hitch Type: Bumper Pull
 •Color: Tan
 
-This trailer is an excellent match for your needs, providing a significant payload capacity that exceeds what you plan to haul. The bumper pull hitch allows for easy towing.
+This trailer is an excellent match for your needs, providing a significant payload capacity that exceeds what you plan to haul. The bumper pull hitch allows for easy towing with your half-ton SUV.
 ```
 
 - **Do not** add lines like "View this trailer", "Click here", or paste the raw URL again on its own line — the hyperlinked title plus card citation rules below are enough.
@@ -813,12 +734,14 @@ This trailer is an excellent match for your needs, providing a significant paylo
 
 ## OBJECTION HANDLING
 - "don't know what size" → "No problem — if you tell me what you're hauling and about how much it weighs, I can usually narrow the size down pretty quickly."
+- "don't know what my truck can tow" → "I can help narrow options, but final towing capacity should be confirmed for your exact truck. What are you towing with — even a rough answer helps."
 - "too expensive" → "Understood. We can usually narrow things down by budget, size, and how often you'll use it so you're not buying more trailer than you need. Do you have a budget range in mind?"
 - "only need it once in a while" → "In that case it often makes sense to focus on the simplest trailer that safely fits what you're hauling. What are you hauling, and how heavy is it?"
 - "want the lightest trailer" → "Aluminum may be worth looking at if lightweight and corrosion resistance are priorities. What type of trailer are you wanting in aluminum?"
 - "never bought one before" → "No problem at all — that's exactly what I can help with. We can keep it simple and start with what you're hauling."
 
 ## SAFETY GUARDRAILS — never state these as confirmed facts
+- **Towing capacity:** "I can help narrow options, but final towing capacity should be confirmed for your exact truck setup."
 - **Payload / GVWR fit:** "Final payload fit should be confirmed from the actual trailer specs."
 - **CDL thresholds:** "I can help point you in the right direction, but final CDL and legal compliance should be confirmed for your full setup and location."
 - **Brake requirements:** "Brake requirements can vary — final requirements should be confirmed for your location and setup."
@@ -948,28 +871,18 @@ class TrailerAgent:
         *,
         required_payload_lbs: Optional[float],
         required_length_ft: Optional[float],
-        required_gvwr_lbs: Optional[float],
         desired_count: int,
         warn_ratio: float = RERANK_WARN_RATIO,
         extreme_ratio: float = RERANK_EXTREME_RATIO,
     ) -> tuple[list[TrailerListing], dict[str, Any]]:
-        needs_present = (
-            required_payload_lbs is not None
-            or required_length_ft is not None
-            or required_gvwr_lbs is not None
-        )
-        required_dim_count = (
-            int(required_payload_lbs is not None)
-            + int(required_length_ft is not None)
-            + int(required_gvwr_lbs is not None)
-        )
+        needs_present = required_payload_lbs is not None or required_length_ft is not None
+        required_dim_count = int(required_payload_lbs is not None) + int(required_length_ft is not None)
         if not listings or not needs_present:
             return listings, {
                 "applied": False,
                 "reason": "missing_clear_requirements_or_no_listings",
                 "required_payload_lbs": required_payload_lbs,
                 "required_length_ft": required_length_ft,
-                "required_gvwr_lbs": required_gvwr_lbs,
             }
 
         def _emit_rerank_score_logs(
@@ -987,7 +900,7 @@ class TrailerAgent:
                 lst = e["listing"]
                 decision_rank = decision_rank_by_entry.get(id(e))
                 logger.info(
-                    "RERANK_SCORE | phase=%s | fetched_pos=%s | decision_rank=%s | listing_id=%s | title=%s | base_score=%.6f | penalty=%.6f | fit_score=%.6f | payload_ratio=%s | length_ratio=%s | gvwr_ratio=%s | fail_count=%s | missing_count=%s | has_all_required_dims=%s | payload_spec_tier=%s | length_exact_rank=%s | gvwr_spec_tier=%s",
+                    "RERANK_SCORE | phase=%s | fetched_pos=%s | decision_rank=%s | listing_id=%s | title=%s | base_score=%.6f | penalty=%.6f | fit_score=%.6f | payload_ratio=%s | length_ratio=%s | fail_count=%s | missing_count=%s | has_all_required_dims=%s",
                     phase_name,
                     fetched_pos,
                     decision_rank if decision_rank is not None else "None",
@@ -998,13 +911,9 @@ class TrailerAgent:
                     float(e["fit_score"]),
                     e["payload_ratio"],
                     e["length_ratio"],
-                    e["gvwr_ratio"],
                     e["fail_count"],
                     e["missing_count"],
                     e["has_all_required_dims"],
-                    e.get("payload_spec_tier"),
-                    e.get("length_exact_rank"),
-                    e.get("gvwr_spec_tier"),
                 )
 
         def _entry_for_debug(e: dict[str, Any], decision_rank: Optional[int]) -> dict[str, Any]:
@@ -1017,14 +926,10 @@ class TrailerAgent:
                 "penalty": e["penalty"],
                 "payload_ratio": e["payload_ratio"],
                 "length_ratio": e["length_ratio"],
-                "gvwr_ratio": e["gvwr_ratio"],
                 "payload_from": e["payload_from"],
                 "fail_count": e["fail_count"],
                 "missing_count": e["missing_count"],
                 "has_all_required_dims": e["has_all_required_dims"],
-                "payload_spec_tier": e.get("payload_spec_tier"),
-                "length_exact_rank": e.get("length_exact_rank"),
-                "gvwr_spec_tier": e.get("gvwr_spec_tier"),
             }
 
         def _build_debug_payload(
@@ -1044,33 +949,29 @@ class TrailerAgent:
                 "phase": phase_name,
                 "required_payload_lbs": required_payload_lbs,
                 "required_length_ft": required_length_ft,
-                "required_gvwr_lbs": required_gvwr_lbs,
                 "warn_ratio": warn_ratio,
                 "extreme_ratio": extreme_ratio,
                 "ranked_fit_summary": ranked_preview,
                 "all_scores": all_scores,
             }
 
-        def _length_overage_for_sort(e: dict[str, Any]) -> float:
-            if required_length_ft is None:
-                return 0.0
-            lr = e.get("length_ratio")
-            if lr is None:
-                return 999.0
-            return max(0.0, float(lr) - 1.0)
-
-        def _merged_fit_sort_key(e: dict[str, Any]) -> tuple[Any, ...]:
-            # 1) Fewest missing required dimensions, 2) better payload spec source,
-            # 3) length exact as tie-break (not a global prefix), 4) GVWR present,
-            # 5) legacy tie-breakers.
+        def _nonfailing_sort_key(e: dict[str, Any]) -> tuple[Any, ...]:
+            # When a target length exists, prefer the least oversize first.
+            length_missing = 0
+            length_overage = 0.0
+            if required_length_ft is not None:
+                lr = e.get("length_ratio")
+                if lr is None:
+                    length_missing = 1
+                    length_overage = 999.0
+                else:
+                    length_overage = max(0.0, float(lr) - 1.0)
             return (
-                e["missing_count"],
-                int(e.get("payload_spec_tier", 0)),
-                int(e.get("length_exact_rank", 0)),
-                int(e.get("gvwr_spec_tier", 0)),
                 not e["has_all_required_dims"],
-                round(_length_overage_for_sort(e), 6),
+                length_missing,
+                round(length_overage, 6),
                 e["penalty"],
+                e["missing_count"],
                 -e["base_score"],
             )
 
@@ -1082,7 +983,6 @@ class TrailerAgent:
                 payload = _parse_lbs(lst.gvwr)
                 payload_from = "gvwr" if payload is not None else "unknown"
             length_ft = _parse_length_ft(lst.length)
-            gvwr_lbs = _parse_lbs(lst.gvwr)
 
             payload_ratio = (
                 (payload / required_payload_lbs)
@@ -1092,11 +992,6 @@ class TrailerAgent:
             length_ratio = (
                 (length_ft / required_length_ft)
                 if (required_length_ft is not None and length_ft is not None and required_length_ft > 0)
-                else None
-            )
-            gvwr_ratio = (
-                (gvwr_lbs / required_gvwr_lbs)
-                if (required_gvwr_lbs is not None and gvwr_lbs is not None and required_gvwr_lbs > 0)
                 else None
             )
 
@@ -1109,7 +1004,6 @@ class TrailerAgent:
             dims = [
                 ("payload", payload_ratio, required_payload_lbs is not None),
                 ("length", length_ratio, required_length_ft is not None),
-                ("gvwr", gvwr_ratio, required_gvwr_lbs is not None),
             ]
             for dim_name, ratio, required in dims:
                 if not required:
@@ -1136,29 +1030,6 @@ class TrailerAgent:
                     # Use GVWR only as fallback signal when payload is missing.
                     penalty += 0.2
 
-            if required_payload_lbs is None:
-                payload_spec_tier = 0
-            elif payload_ratio is None:
-                payload_spec_tier = 2
-            elif payload_from == "payload_capacity" and _spec_str_nonempty(lst.payload_capacity):
-                payload_spec_tier = 0
-            else:
-                payload_spec_tier = 1
-
-            if required_length_ft is None:
-                length_exact_rank = 0
-            elif length_ratio is None:
-                length_exact_rank = 2
-            elif abs(float(length_ratio) - 1.0) <= 1e-6:
-                length_exact_rank = 0
-            else:
-                length_exact_rank = 1
-
-            if required_gvwr_lbs is None:
-                gvwr_spec_tier = 0
-            else:
-                gvwr_spec_tier = 0 if gvwr_ratio is not None else 1
-
             base_score = float(lst.score or 0.0)
             entries.append(
                 {
@@ -1175,28 +1046,39 @@ class TrailerAgent:
                     "max_ratio": round(max_ratio, 6),
                     "payload_ratio": None if payload_ratio is None else round(payload_ratio, 6),
                     "length_ratio": None if length_ratio is None else round(length_ratio, 6),
-                    "gvwr_ratio": None if gvwr_ratio is None else round(gvwr_ratio, 6),
                     "payload_from": payload_from,
-                    "payload_spec_tier": payload_spec_tier,
-                    "length_exact_rank": length_exact_rank,
-                    "gvwr_spec_tier": gvwr_spec_tier,
                 }
             )
 
-        # When the customer required a length, we previously prefixed all
-        # exact-length matches ahead of the rest, which could rank
-        # "length exact + missing payload" above "complete payload + not exact length".
-        # Merged key sorts all non-failing results once: complete specs first, then
-        # length exact as a tie-break (length_exact_rank), not a hard prefix.
+        # Hard length-first phase:
+        # If the customer specified a target length, prefer exact-length fits
+        # (ratio == 1.0) before considering any oversized options.
         if required_length_ft is not None:
-            nonfailing = [
+            phase_len_exact = [
                 e
                 for e in entries
-                if e["fail_count"] == 0 and e["used_dims"] > 0
+                if e["fail_count"] == 0
+                and e["used_dims"] > 0
+                and e["length_ratio"] is not None
+                and abs(float(e["length_ratio"]) - 1.0) <= 1e-6
             ]
-            if nonfailing:
-                ranked_entries = sorted(nonfailing, key=_merged_fit_sort_key)
-                phase = "phase_nonfailing_merged_fit"
+            if phase_len_exact:
+                ranked_len_exact = sorted(phase_len_exact, key=_nonfailing_sort_key)
+                if len(ranked_len_exact) >= max(1, desired_count):
+                    ranked_entries = ranked_len_exact
+                    phase = "phase_len_exact_first"
+                else:
+                    remainder_nonfailing = sorted(
+                        [
+                            e
+                            for e in entries
+                            if e["fail_count"] == 0 and e["used_dims"] > 0 and e not in ranked_len_exact
+                        ],
+                        key=_nonfailing_sort_key,
+                    )
+                    ranked_entries = ranked_len_exact + remainder_nonfailing
+                    phase = "phase_len_exact_with_fill"
+
                 _emit_rerank_score_logs(
                     phase_name=phase,
                     all_entries=entries,
@@ -1213,7 +1095,7 @@ class TrailerAgent:
             if e["fail_count"] == 0 and e["used_dims"] > 0 and e["max_ratio"] <= extreme_ratio
         ]
         if phase_a:
-            ranked_phase_a = sorted(phase_a, key=_merged_fit_sort_key)
+            ranked_phase_a = sorted(phase_a, key=_nonfailing_sort_key)
             phase = "phase_a_non_extreme_fit"
             if len(ranked_phase_a) >= max(1, desired_count):
                 ranked_entries = ranked_phase_a
@@ -1223,7 +1105,7 @@ class TrailerAgent:
                         e for e in entries
                         if e not in ranked_phase_a and e["fail_count"] == 0 and e["used_dims"] > 0
                     ],
-                    key=_merged_fit_sort_key,
+                    key=_nonfailing_sort_key,
                 )
                 # Fill to desired count with closest oversized options if needed.
                 ranked_entries = ranked_phase_a + phase_b_fill
@@ -1234,13 +1116,19 @@ class TrailerAgent:
                 if e["fail_count"] == 0 and e["used_dims"] > 0
             ]
             if phase_b:
-                ranked_entries = sorted(phase_b, key=_merged_fit_sort_key)
+                ranked_entries = sorted(phase_b, key=_nonfailing_sort_key)
                 phase = "phase_b_fallback_oversized"
             else:
                 # Last resort: keep recommendation flow alive while heavily preferring closest fit.
                 ranked_entries = sorted(
                     entries,
-                    key=_merged_fit_sort_key,
+                    key=lambda e: (
+                        not e["has_all_required_dims"],
+                        e["fail_count"],
+                        e["penalty"],
+                        e["missing_count"],
+                        -e["base_score"],
+                    ),
                 )
                 phase = "phase_b_last_resort_no_clear_fit"
 
@@ -1262,35 +1150,7 @@ class TrailerAgent:
         query = args.pop("query")
         required_payload_lbs = _coerce_required_payload_lbs(args.pop("required_payload_lbs", None))
         required_length_ft = _coerce_required_length_ft(args.pop("required_length_ft", None))
-        required_gvwr_lbs = _coerce_required_payload_lbs(args.pop("required_gvwr_lbs", None))
         requirements_source = "tool_args"
-
-        hitch_type: Optional[str] = args.pop("hitch_type", None)
-        hitch_type_source: Optional[str] = "tool_args" if hitch_type else None
-        if not hitch_type:
-            inferred_h = _infer_hitch_type_from_text(query)
-            if inferred_h:
-                hitch_type = inferred_h
-                hitch_type_source = "inferred_from_query"
-        if not hitch_type:
-            for msg in reversed(self._history):
-                if not isinstance(msg, dict) or msg.get("role") != "user":
-                    continue
-                inferred_h = _infer_hitch_type_from_text(str(msg.get("content") or ""))
-                if inferred_h:
-                    hitch_type = inferred_h
-                    hitch_type_source = "inferred_from_history"
-                    break
-        if hitch_type:
-            normalized_h = normalize_hitch(hitch_type)
-            if normalized_h:
-                hitch_type = normalized_h
-            if hitch_type_source and hitch_type_source != "tool_args":
-                logger.info(
-                    "HITCH_INFERRED | hitch_type=%s | source=%s",
-                    hitch_type,
-                    hitch_type_source,
-                )
 
         # Fallback: if model omitted explicit need fields, infer from query/user history.
         if required_payload_lbs is None or required_length_ft is None:
@@ -1324,18 +1184,6 @@ class TrailerAgent:
                 if required_payload_lbs is not None and required_length_ft is not None:
                     break
 
-        light_cargo_detected = _is_clear_light_cargo_text(query)
-        if not light_cargo_detected:
-            for msg in reversed(self._history):
-                if not isinstance(msg, dict) or msg.get("role") != "user":
-                    continue
-                if _is_clear_light_cargo_text(str(msg.get("content") or "")):
-                    light_cargo_detected = True
-                    break
-        if required_payload_lbs is None and light_cargo_detected:
-            required_payload_lbs = 1000.0
-            requirements_source = "light_cargo_default"
-
         trailer_filter = TrailerFilter(
             condition=args.get("condition"),
             price_min=args.get("price_min"),
@@ -1343,9 +1191,7 @@ class TrailerAgent:
             category_subcategory=args.get("category_subcategory"),
             make=args.get("make"),
             color=args.get("color"),
-            hitch_type=hitch_type,
-            required_length_ft=required_length_ft,
-            required_gvwr_lbs=required_gvwr_lbs,
+            hitch_type=args.get("hitch_type"),
         )
 
         query_for_search = query
@@ -1358,24 +1204,20 @@ class TrailerAgent:
             ql,
         ):
             normalized_fragments.append(f"{round(required_length_ft, 2)} ft")
-        if required_gvwr_lbs is not None and not re.search(r"\bgvwr\b", ql):
-            normalized_fragments.append(f"minimum gvwr {round(required_gvwr_lbs)} lbs")
         if normalized_fragments:
             query_for_search = f"{query} | normalized_requirements: {' '.join(normalized_fragments)}"
 
         listings, search_attempts = self._search(query_for_search, trailer_filter, top_k=SEARCH_TOP_K)
         logger.info(
-            "RERANK_INPUT | payload_lbs=%s | length_ft=%s | gvwr_lbs=%s | source=%s",
+            "RERANK_INPUT | payload_lbs=%s | length_ft=%s | source=%s",
             required_payload_lbs,
             required_length_ft,
-            required_gvwr_lbs,
             requirements_source,
         )
         reranked, rerank_debug = self._rerank_by_fit(
             listings,
             required_payload_lbs=required_payload_lbs,
             required_length_ft=required_length_ft,
-            required_gvwr_lbs=required_gvwr_lbs,
             desired_count=SEARCH_MAX_RECOMMENDATIONS,
         )
         logger.info(
@@ -1427,11 +1269,8 @@ class TrailerAgent:
             "query": query,
             "query_for_search": query_for_search,
             "trailer_filter": tfilter,
-            "hitch_type": hitch_type,
-            "hitch_type_source": hitch_type_source,
             "required_payload_lbs": required_payload_lbs,
             "required_length_ft": required_length_ft,
-            "required_gvwr_lbs": required_gvwr_lbs,
             "requirements_source": requirements_source,
             "search_attempts": search_attempts,
             "rerank": rerank_debug,

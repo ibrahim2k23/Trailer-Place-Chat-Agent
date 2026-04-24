@@ -6,7 +6,11 @@
 .env.local
 .env.*.local
 
+# Local daily logs
+log/
+
 # Bytecode
 __pycache__/
 *.py[cod]
 *$py.class
+

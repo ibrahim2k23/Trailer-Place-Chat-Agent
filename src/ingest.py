@@ -4,6 +4,7 @@ Run once to embed all listings and upsert them to Pinecone.
 Usage:
     uv run python src/ingest.py
     uv run python src/ingest.py --force   # re-index even if vectors exist
+    uv run python src/ingest.py --force --no-wipe  # force re-upsert without clearing index
 """
 import json
 import os
@@ -40,7 +41,7 @@ EMBEDDING_MODEL = os.getenv("OPENAI_EMBEDDING_MODEL", "text-embedding-3-small")
 EMBEDDING_DIM = 1536
 BATCH_SIZE = 50
 
-DATA_FILE = Path(__file__).parent.parent / "listings_final_v6.xlsx"
+DATA_FILE = Path(__file__).parent.parent / "listings_final_v5.xlsx"
 
 
 def get_or_create_index(pc: Pinecone):
@@ -86,6 +87,98 @@ def parse_money(val) -> Optional[float]:
         return v if v > 0 else None
     except (TypeError, ValueError):
         return None
+
+
+def parse_lbs(val) -> Optional[float]:
+    """Parse weight-like text and normalize to lbs."""
+    if val is None:
+        return None
+    if isinstance(val, float) and pd.isna(val):
+        return None
+    if isinstance(val, (int, float)):
+        try:
+            out = float(val)
+            return out if out > 0 else None
+        except (TypeError, ValueError):
+            return None
+    s = str(val).strip().lower()
+    if not s:
+        return None
+    s = s.replace(",", "")
+
+    m = re.search(r"\b(\d+(?:\.\d+)?)\s*(k|m)\b", s)
+    if m:
+        qty = float(m.group(1))
+        mult = 1000.0 if m.group(2) == "k" else 1_000_000.0
+        out = qty * mult
+        return out if out > 0 else None
+
+    m = re.search(r"\b(\d+(?:\.\d+)?)\s*(?:lb|lbs|pound|pounds|#)\b", s)
+    if m:
+        out = float(m.group(1))
+        return out if out > 0 else None
+    m = re.search(r"\b(\d+(?:\.\d+)?)\s*(?:kg|kgs|kilogram|kilograms)\b", s)
+    if m:
+        out = float(m.group(1)) * 2.2046226218
+        return out if out > 0 else None
+    m = re.search(r"\b(\d+(?:\.\d+)?)\s*(?:ton|tons|tonne|tonnes)\b", s)
+    if m:
+        out = float(m.group(1)) * 2000.0
+        return out if out > 0 else None
+
+    m = re.search(r"\b(\d+(?:\.\d+)?)\b", s)
+    if not m:
+        return None
+    out = float(m.group(1))
+    return out if out > 0 else None
+
+
+def parse_length_ft(val) -> Optional[float]:
+    """Parse length-like text and normalize to feet."""
+    if val is None:
+        return None
+    if isinstance(val, float) and pd.isna(val):
+        return None
+    if isinstance(val, (int, float)):
+        try:
+            out = float(val)
+            return out if out > 0 else None
+        except (TypeError, ValueError):
+            return None
+    s = str(val).strip().lower()
+    if not s:
+        return None
+
+    ft_m = re.search(r"(\d+(?:\.\d+)?)\s*(?:ft|feet|['′]|`(?!`))", s)
+    in_m = re.search(r"(\d+(?:\.\d+)?)\s*(?:in|inch|inches|\"|``|″)", s)
+    if ft_m:
+        ft = float(ft_m.group(1))
+        inches = float(in_m.group(1)) if in_m else 0.0
+        out = ft + (inches / 12.0)
+        return out if out > 0 else None
+    if in_m:
+        out = float(in_m.group(1)) / 12.0
+        return out if out > 0 else None
+    yd_m = re.search(r"(\d+(?:\.\d+)?)\s*(?:yd|yds|yard|yards)\b", s)
+    if yd_m:
+        out = float(yd_m.group(1)) * 3.0
+        return out if out > 0 else None
+    m_m = re.search(r"(\d+(?:\.\d+)?)\s*(?:m|meter|meters|metre|metres)\b", s)
+    if m_m:
+        out = float(m_m.group(1)) * 3.280839895
+        return out if out > 0 else None
+    cm_m = re.search(r"(\d+(?:\.\d+)?)\s*(?:cm|centimeter|centimeters|centimetre|centimetres)\b", s)
+    if cm_m:
+        out = float(cm_m.group(1)) / 30.48
+        return out if out > 0 else None
+    mm_m = re.search(r"(\d+(?:\.\d+)?)\s*(?:mm|millimeter|millimeters|millimetre|millimetres)\b", s)
+    if mm_m:
+        out = float(mm_m.group(1)) / 304.8
+        return out if out > 0 else None
+    if re.fullmatch(r"\d+(?:\.\d+)?", s):
+        out = float(s)
+        return out if out > 0 else None
+    return None
 
 
 def _money_from_info(info: dict, *keys: str) -> Optional[float]:
@@ -153,11 +246,11 @@ def build_record(row: pd.Series, row_idx: int) -> dict:
     width = str(info.get("width", "")).strip() or None
     axles = str(info.get("axles", "")).strip() or None
     gvwr = str(info.get("gvwr", "")).strip() or None
+    gvwr_lbs_num = parse_lbs(gvwr)
     payload = str(info.get("payload_capacity", "")).strip() or None
     material = str(info.get("trailer_material", "")).strip() or None
     floor = str(info.get("floor", "")).strip() or None
-    payments_from = col("payments_from")
-
+    length_ft_num = parse_length_ft(length)
     embedding_text = build_embedding_text(info, title, dealer_notes)
 
     metadata: dict = {
@@ -173,12 +266,13 @@ def build_record(row: pd.Series, row_idx: int) -> dict:
     for key, val in [
         ("price", price),
         ("hitch_type", hitch),
-        ("payments_from", payments_from if payments_from else None),
         ("year", year),
         ("length", length),
         ("width", width),
         ("axles", axles),
         ("gvwr", gvwr),
+        ("gvwr_lbs_num", gvwr_lbs_num),
+        ("length_ft_num", length_ft_num),
         ("payload_capacity", payload),
         ("trailer_material", material),
         ("floor", floor),
@@ -200,10 +294,13 @@ def embed_batch(client: OpenAI, texts: list) -> list:
     return [item.embedding for item in response.data]
 
 
-def main(force: bool = False):
+def main(force: bool = False, wipe_on_force: bool = True):
     print("Loading data...")
     df = pd.read_excel(DATA_FILE)
-    print(f"  {len(df)} listings loaded.")
+    msrp_cols = [c for c in df.columns if str(c).lower() == "msrp"]
+    if msrp_cols:
+        df = df.drop(columns=msrp_cols)
+    print(f"  {len(df)} listings loaded (msrp column excluded from ingest).")
 
     pc = Pinecone(api_key=PINECONE_API_KEY)
     index = get_or_create_index(pc)
@@ -214,6 +311,12 @@ def main(force: bool = False):
         if total > 0:
             print(f"\nIndex already has {total} vectors. Use --force to re-index.")
             return
+    elif wipe_on_force:
+        print("\n--force enabled: deleting all existing vectors before re-index...")
+        index.delete(delete_all=True)
+        time.sleep(2)
+        stats = index.describe_index_stats()
+        print(f"  Index cleared. total_vector_count={stats.get('total_vector_count', 0)}")
 
     openai_client = OpenAI(api_key=OPENAI_API_KEY)
 
@@ -244,5 +347,10 @@ def main(force: bool = False):
 if __name__ == "__main__":
     parser = argparse.ArgumentParser()
     parser.add_argument("--force", action="store_true", help="Re-index even if vectors exist")
+    parser.add_argument(
+        "--no-wipe",
+        action="store_true",
+        help="With --force, do not clear existing vectors before upsert",
+    )
     args = parser.parse_args()
-    main(force=args.force)
+    main(force=args.force, wipe_on_force=not args.no_wipe)
