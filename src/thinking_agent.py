@@ -66,183 +66,178 @@ def _stage_from_payload(payload: dict[str, Any]) -> str:
     return "search"
 
 
-def _fmt_num(v: Any) -> str:
+def _fmt_num(v: Any, *, none_label: str = "not in payload") -> str:
     if v is None:
-        return "Not available in this turn"
+        return none_label
     if isinstance(v, float):
         return f"{v:.6f}".rstrip("0").rstrip(".")
     return str(v)
 
 
-def _score_justification(score: dict[str, Any]) -> str:
-    dr = score.get("decision_rank")
+def _score_friendly_reason(
+    score: dict[str, Any],
+    req_payload: Any,
+    req_length: Any,
+    req_gvwr: Any,
+) -> str:
+    """Plain-English explanation of why a listing ranked where it did."""
     pr = score.get("payload_ratio")
     lr = score.get("length_ratio")
+    gr = score.get("gvwr_ratio")
     fail_count = int(score.get("fail_count") or 0)
-    missing_count = int(score.get("missing_count") or 0)
+    payload_from = score.get("payload_from") or "unknown"
+    penalty = float(score.get("penalty") or 0.0)
 
-    reasons: list[str] = []
-    if dr is None:
-        reasons.append("it was not selected into ranked output (decision_rank=None)")
-    else:
-        reasons.append(f"it was placed at decision rank {dr}")
+    parts: list[str] = []
 
-    if fail_count > 0:
-        reasons.append(f"it failed {fail_count} required fit checks")
-    if missing_count > 0:
-        reasons.append(f"it is missing {missing_count} required dimensions")
-
-    if pr is not None:
+    # Length
+    if req_length is not None:
         try:
-            p = float(pr)
-            if p < 1.0:
-                reasons.append("its payload ratio is below 1.0 (under required payload)")
-            elif p == 1.0:
-                reasons.append("its payload ratio is exactly 1.0 (exact payload target)")
+            req_l = float(req_length)
+            if lr is None:
+                parts.append("length not listed in inventory")
             else:
-                reasons.append("its payload ratio is above 1.0 (oversized payload vs need)")
+                l = float(lr)
+                trailer_l = round(l * req_l, 1)
+                if l < 1.0:
+                    short_by = round(req_l - trailer_l, 1)
+                    parts.append(
+                        f"only {trailer_l} ft — {short_by} ft shorter than the {req_l:.0f} ft minimum (too short for the load)"
+                    )
+                elif abs(l - 1.0) < 0.01:
+                    parts.append(f"length is exactly {trailer_l} ft — perfect match")
+                else:
+                    over_by = round(trailer_l - req_l, 1)
+                    parts.append(
+                        f"{trailer_l} ft — {over_by} ft longer than the {req_l:.0f} ft requested"
+                    )
         except Exception:
             pass
 
-    if lr is not None:
+    # Payload
+    if req_payload is not None:
         try:
-            l = float(lr)
-            if l < 1.0:
-                reasons.append("its length ratio is below 1.0 (shorter than requested)")
-            elif abs(l - 1.0) < 1e-9:
-                reasons.append("its length ratio is 1.0 (exact requested length)")
+            req_p = float(req_payload)
+            if pr is None:
+                parts.append("payload capacity not listed in this trailer's inventory data")
             else:
-                reasons.append("its length ratio is above 1.0 (longer than requested)")
+                p = float(pr)
+                trailer_cap = round(p * req_p)
+                if p < 1.0:
+                    short_by = round(req_p - trailer_cap)
+                    parts.append(
+                        f"can only carry {trailer_cap:,} lbs — {short_by:,} lbs short of the {req_p:,.0f} lb need"
+                    )
+                else:
+                    extra = " (estimated from GVWR, not a dedicated payload spec)" if payload_from == "gvwr" else ""
+                    parts.append(
+                        f"can carry {trailer_cap:,} lbs — covers the {req_p:,.0f} lb need{extra}"
+                    )
         except Exception:
             pass
 
-    return "; ".join(reasons)
+    # GVWR
+    if req_gvwr is not None:
+        try:
+            req_g = float(req_gvwr)
+            if gr is None:
+                parts.append("GVWR not listed in inventory")
+            else:
+                g = float(gr)
+                trailer_gvwr = round(g * req_g)
+                if g < 1.0:
+                    parts.append(f"GVWR of {trailer_gvwr:,} lbs is below the {req_g:,.0f} lb minimum")
+                else:
+                    parts.append(f"GVWR of {trailer_gvwr:,} lbs meets the {req_g:,.0f} lb requirement")
+        except Exception:
+            pass
+
+    if not parts:
+        parts.append("best available match" if penalty > 0.1 else "strong overall fit")
+
+    if fail_count > 0 and not any("too short" in p or "short of" in p or "below" in p for p in parts):
+        parts.append(f"undersized on {fail_count} required dimension(s)")
+
+    return "; ".join(parts)
 
 
-def _deterministic_recommendation_flow(payload: dict[str, Any]) -> str:
+def _deterministic_qualification_flow(payload: dict[str, Any]) -> str:
+    history = payload.get("conversation_window") or []
+    user_turns = [m for m in history if m.get("role") == "user"]
+    assistant_msg = str(payload.get("assistant_message") or "").strip()
+    user_msg = str(payload.get("user_message") or "").strip()
+    turn_n = len(user_turns)
+
+    # First turn — user just gave contact info, skip insight
+    if turn_n <= 1:
+        return ""
+
+    collected = user_msg[:80].rstrip(".").rstrip(",") if user_msg else ""
+
+    # Extract the question the agent just asked
+    question_topic = ""
+    for sentence in (assistant_msg or "").replace("?", "?.").split("."):
+        s = sentence.strip()
+        if s.endswith("?"):
+            question_topic = s.rstrip("?").strip().lower()
+            break
+
+    if collected and question_topic:
+        return f"Got: {collected}. Asking about {question_topic} to narrow down the right trailer."
+    if collected:
+        return f"Got: {collected}. Still gathering details before searching inventory."
+    return "Still collecting customer requirements before running a search."
+
+
+def _deterministic_thinking_flow(payload: dict[str, Any]) -> str:
+    """Build a plain-text insights note from payload data."""
+    stage = _stage_from_payload(payload)
+    if stage == "qualification":
+        return _deterministic_qualification_flow(payload)
+
     tool_runs = payload.get("tool_runs") or []
     last_run = tool_runs[-1] if tool_runs else {}
     search_attempts = (last_run or {}).get("search_attempts") or []
     rerank = (last_run or {}).get("rerank") or {}
     all_scores = rerank.get("all_scores") or []
-    selected = payload.get("selected_recommendations") or []
     req_payload = last_run.get("required_payload_lbs")
     req_length = last_run.get("required_length_ft")
-    req_source = last_run.get("requirements_source")
+    req_gvwr = last_run.get("required_gvwr_lbs")
+    trailer_filter = (last_run or {}).get("trailer_filter") or {}
 
-    lines: list[str] = [
-        "# Thinking Flow",
-        "",
-        "## Current Step",
-        "Recommendation",
-        "",
-        "## What Happened In This Turn",
-        (
-            f"The assistant executed inventory search and reranking for the user's request "
-            f"(required_payload_lbs={_fmt_num(req_payload)}, required_length_ft={_fmt_num(req_length)}, "
-            f"requirements_source={_fmt_num(req_source)})."
-        ),
-        "",
-        "## Evidence Used In This Turn",
-    ]
-
-    strict_attempts = [a for a in search_attempts if isinstance(a, dict) and a.get("phase") == "strict"]
-    relaxed_attempts = [a for a in search_attempts if isinstance(a, dict) and a.get("phase") == "relaxed"]
-    if strict_attempts:
-        s0 = strict_attempts[0]
-        lines.append(
-            f"- Pinecone strict filter: `{_fmt_num(s0.get('pinecone_filter'))}`; top_k={_fmt_num(s0.get('top_k'))}; match_count={_fmt_num(s0.get('match_count'))}."
-        )
-    if relaxed_attempts:
-        r0 = relaxed_attempts[0]
-        lines.append(
-            f"- Pinecone relaxed filter: `{_fmt_num(r0.get('pinecone_filter'))}`; top_k={_fmt_num(r0.get('top_k'))}; match_count={_fmt_num(r0.get('match_count'))}."
-        )
-    lines.append(
-        f"- Rerank phase: `{_fmt_num(rerank.get('phase'))}`; warn_ratio={_fmt_num(rerank.get('warn_ratio'))}; extreme_ratio={_fmt_num(rerank.get('extreme_ratio'))}."
-    )
-
-    if all_scores:
-        lines.append("")
-        lines.append("### Per Listing Rerank Justification")
-        for s in all_scores:
-            lines.append(
-                "- "
-                f"{_fmt_num(s.get('listing_id'))} | "
-                f"decision_rank={_fmt_num(s.get('decision_rank'))}, "
-                f"base_score={_fmt_num(s.get('base_score'))}, "
-                f"penalty={_fmt_num(s.get('penalty'))}, "
-                f"fit_score={_fmt_num(s.get('fit_score'))}, "
-                f"payload_ratio={_fmt_num(s.get('payload_ratio'))}, "
-                f"length_ratio={_fmt_num(s.get('length_ratio'))}, "
-                f"fail_count={_fmt_num(s.get('fail_count'))}, "
-                f"missing_count={_fmt_num(s.get('missing_count'))}. "
-                f"Reason: {_score_justification(s)}."
-            )
+    strict = [a for a in search_attempts if isinstance(a, dict) and a.get("phase") == "strict"]
+    relaxed = [a for a in search_attempts if isinstance(a, dict) and a.get("phase") == "relaxed"]
+    if strict:
+        mc = strict[0].get("match_count", 0)
+        search_note = f"Searched inventory with all filters — found {mc} trailer(s)."
+    elif relaxed:
+        mc = relaxed[0].get("match_count", 0)
+        search_note = f"No strict matches — relaxed filters found {mc} trailer(s)."
     else:
-        lines.append("- Rerank evidence is not available in this turn.")
+        search_note = "Searched inventory."
 
-    if selected:
-        lines.append("")
-        lines.append("### Selected Recommendations (Final)")
-        for row in selected:
-            lines.append(
-                "- "
-                f"rank={_fmt_num(row.get('rank'))} | "
-                f"{_fmt_num(row.get('title'))} | "
-                f"length={_fmt_num(row.get('length'))} | "
-                f"payload_capacity={_fmt_num(row.get('payload_capacity'))} | "
-                f"gvwr={_fmt_num(row.get('gvwr'))}."
-            )
-
-    return "\n".join(lines)
-
-
-def _deterministic_nonsearch_flow(payload: dict[str, Any], stage: str) -> str:
-    user_msg = str(payload.get("user_message") or "").strip()
-    assistant_msg = str(payload.get("assistant_message") or "").strip()
-    stage_name = "Qualification" if stage == "qualification" else "Search"
-    return "\n".join(
-        [
-            "# Thinking Flow",
-            "",
-            "## Current Step",
-            stage_name,
-            "",
-            "## What Happened In This Turn",
-            (
-                "The assistant handled only the current conversational step and did not complete recommendation ranking yet."
-                if stage == "qualification"
-                else "The assistant completed search-stage actions for this turn."
-            ),
-            "",
-            "## Evidence Used In This Turn",
-            f"- User message: {user_msg or 'Not available in this turn'}",
-            f"- Assistant message: {assistant_msg or 'Not available in this turn'}",
-        ]
+    shown = sorted(
+        [s for s in all_scores if s.get("decision_rank") is not None],
+        key=lambda s: s.get("decision_rank") or 99,
     )
+    if not shown:
+        category = trailer_filter.get("category_subcategory") or trailer_filter.get("category") or ""
+        hitch = trailer_filter.get("hitch_type") or ""
+        specs = ", ".join(filter(None, [category, hitch]))
+        suffix = f"No trailers matched {specs} well enough to recommend." if specs else "No strong matches found."
+        return f"{search_note} {suffix}"
+
+    parts = [search_note]
+    for s in shown:
+        rank = s.get("decision_rank")
+        title = s.get("title") or "Unknown trailer"
+        reason = _score_friendly_reason(s, req_payload, req_length, req_gvwr)
+        parts.append(f"#{rank} {title} — {reason}.")
+    return " ".join(parts)
 
 
-def _deterministic_thinking_flow(payload: dict[str, Any]) -> str:
-    stage = _stage_from_payload(payload)
-    if stage in ("recommendation", "reranking"):
-        return _deterministic_recommendation_flow(payload)
-    return _deterministic_nonsearch_flow(payload, stage)
-
-
-def _recommendation_output_is_acceptable(text: str, payload: dict[str, Any]) -> bool:
-    stage = _stage_from_payload(payload)
-    if stage not in ("recommendation", "reranking"):
-        return True
-    # Minimum required anchors for recommendation-stage explanation.
-    must_have = [
-        "Pinecone strict filter",
-        "Rerank phase",
-        "decision_rank=",
-        "fit_score=",
-        "Reason:",
-    ]
-    return all(token in text for token in must_have)
+def _recommendation_output_is_acceptable(text: str) -> bool:
+    return bool(text and len(text.strip()) > 20)
 
 
 def _thinking_prompt(payload: dict[str, Any]) -> tuple[str, str]:
@@ -251,37 +246,39 @@ def _thinking_prompt(payload: dict[str, Any]) -> tuple[str, str]:
     selected = payload.get("selected_recommendations") or []
     last_run = tool_runs[-1] if tool_runs else {}
     rerank = last_run.get("rerank") if isinstance(last_run, dict) else {}
-    has_rerank_scores = bool((rerank or {}).get("all_scores"))
     enriched_payload = {
         **payload,
         "current_stage": stage,
         "has_tool_run": bool(tool_runs),
-        "has_rerank_scores": has_rerank_scores,
+        "has_rerank_scores": bool((rerank or {}).get("all_scores")),
         "has_selected_recommendations": bool(selected),
     }
 
     system = (
-        "You are a transparent step-by-step explainer for a trailer-sales chatbot.\n"
-        "Write only what happened in the CURRENT turn and CURRENT stage.\n"
-        "Never speculate, never invent numbers, never describe future steps that did not happen yet.\n"
-        "If a value is missing in payload, explicitly write 'Not available in this turn'.\n"
-        "Do not use placeholders like Listing A/B/C."
+        "You write short plain-English insights for a trailer dealership owner reviewing their AI sales assistant. "
+        "Write naturally — like a knowledgeable colleague explaining what just happened. "
+        "No markdown, no headers, no bullet points, no field names or technical jargon. "
+        "Never show ratios, penalties, or raw scores. Be specific and concise."
     )
-    user = (
-        "Create a markdown report titled 'Thinking Flow'.\n"
-        "The report must be ONLY about this turn and must stay concise.\n\n"
-        "Required sections:\n"
-        "1) Current Step\n"
-        "2) What Happened In This Turn\n"
-        "3) Evidence Used In This Turn\n\n"
-        "Rules by stage:\n"
-        "- If current_stage=qualification: do NOT mention Pinecone search/rerank/recommendations as completed actions.\n"
-        "- If current_stage=search: mention Pinecone filter/query result count only.\n"
-        "- If current_stage=reranking or recommendation and rerank scores exist: include one bullet per fetched listing with exact fields: decision_rank, base_score, penalty, fit_score, payload_ratio, length_ratio, fail_count, missing_count.\n"
-        "- If rerank scores do not exist: explicitly say rerank evidence is not available in this turn.\n"
-        "- Keep it 6-18 lines total. No fabricated examples.\n\n"
-        f"INPUT_PAYLOAD_JSON:\n{_safe_json(enriched_payload)}"
-    )
+
+    if stage == "qualification":
+        user = (
+            "In 1-2 natural sentences, explain: what useful information did we just collect from the customer, "
+            "and what is the agent trying to find out next and why does it matter for picking the right trailer?\n"
+            "Write it as a smooth insight, not a literal transcript. Example style: "
+            "'Got the payload weight — 4,000 lbs of furniture. Now asking for preferred length to match the right trailer size.'\n"
+            "If this is the very first message (customer just gave name/phone/email), return exactly: SKIP\n\n"
+            f"PAYLOAD:\n{_safe_json(enriched_payload)}"
+        )
+    else:
+        user = (
+            "In plain text (no markdown, no bullets), write a short insight covering:\n"
+            "1. How many trailers were found and whether strict or relaxed filters were used (one short sentence).\n"
+            "2. For EACH shown trailer, one sentence: its name and why it fits — compare length, payload, or GVWR "
+            "to what the customer needs in plain English (e.g. '24 ft — 4 ft longer than requested but well within payload').\n"
+            "Keep the whole thing under 60 words. Never invent data not in the payload.\n\n"
+            f"PAYLOAD:\n{_safe_json(enriched_payload)}"
+        )
     return system, user
 
 
@@ -306,7 +303,8 @@ async def generate_thinking_flow_async(payload: dict[str, Any]) -> dict[str, Any
             temperature=0.2,
         )
         text = (resp.choices[0].message.content or "").strip()
-        if not _recommendation_output_is_acceptable(text, payload):
+        # LLM signals first-turn skip, or output is unusable — fall back to deterministic
+        if text.upper() == "SKIP" or not _recommendation_output_is_acceptable(text):
             text = _deterministic_thinking_flow(payload)
         return {
             "status": "ok",

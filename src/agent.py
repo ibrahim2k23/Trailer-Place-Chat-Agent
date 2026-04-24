@@ -1106,10 +1106,13 @@ class TrailerAgent:
             return max(0.0, float(lr) - 1.0)
 
         def _merged_fit_sort_key(e: dict[str, Any]) -> tuple[Any, ...]:
-            # 1) Fewest missing required dimensions, 2) better payload spec source,
-            # 3) length exact as tie-break (not a global prefix), 4) GVWR present,
-            # 5) legacy tie-breakers.
+            # Severely oversized listings (penalty > 3.0, no fails) should not beat
+            # partial-data listings with near-perfect fit just because they have
+            # "complete" dimension data.  A 2x-oversized trailer with all spec fields
+            # is a worse recommendation than an exact-length match missing payload data.
+            severe_oversize = e["fail_count"] == 0 and e["penalty"] > 3.0
             return (
+                severe_oversize,
                 e["missing_count"],
                 int(e.get("payload_spec_tier", 0)),
                 int(e.get("length_exact_rank", 0)),

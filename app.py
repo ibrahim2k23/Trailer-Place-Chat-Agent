@@ -288,15 +288,22 @@ if "last_thinking_payload" not in st.session_state:
 thinking_future = st.session_state.get("thinking_future")
 if isinstance(thinking_future, Future) and thinking_future.done():
     try:
-        st.session_state.last_thinking_result = thinking_future.result()
+        _thinking_result = thinking_future.result()
+        st.session_state.last_thinking_result = _thinking_result
         st.session_state.thinking_status = "done"
     except Exception as exc:
-        st.session_state.last_thinking_result = {
+        _thinking_result = {
             "status": "error",
             "error": str(exc),
             "thinking_markdown": "",
         }
+        st.session_state.last_thinking_result = _thinking_result
         st.session_state.thinking_status = "error"
+    # Attach result to the last assistant message so it renders inline.
+    for _j in range(len(st.session_state.messages) - 1, -1, -1):
+        if st.session_state.messages[_j]["role"] == "assistant":
+            st.session_state.messages[_j]["thinking_result"] = _thinking_result
+            break
     st.session_state.thinking_future = None
 elif (
     isinstance(thinking_future, Future)
@@ -320,26 +327,6 @@ with st.sidebar:
     st.markdown("💳 Financing available")
     st.markdown("🚚 Delivery available")
     st.divider()
-    st.markdown("### Thinking Flow")
-    if not thinking_agent_enabled():
-        st.caption("Thinking agent is disabled (`THINKING_AGENT_ENABLED=0`).")
-    else:
-        status = st.session_state.get("thinking_status", "idle")
-        if status == "pending":
-            st.caption("Generating thinking flow in background...")
-        elif status == "error":
-            err = (st.session_state.get("last_thinking_result") or {}).get("error", "unknown error")
-            st.caption(f"Thinking flow failed: {err}")
-        result = st.session_state.get("last_thinking_result") or {}
-        text = (result.get("thinking_markdown") or "").strip()
-        if text:
-            # Avoid st.expander: Material chevron can render as literal "arrow_down" when the
-            # icon font does not load (same issue as feedback popover/expanders in chat).
-            st.caption("Latest turn reasoning")
-            with st.container(border=True):
-                st.markdown(text)
-        st.caption("Saved to `thinking_log/YYYY-MM-DD-thinking.log`.")
-
     if st.button("↺  New Conversation", use_container_width=True):
         st.session_state.agent = TrailerAgent()
         st.session_state.messages = []
@@ -457,6 +444,24 @@ else:
                                     )
                                 st.rerun()
 
+                # ── Inline thinking note (every turn) ─────────────────────
+                thinking_result = msg.get("thinking_result")
+                is_last_msg = (i == len(st.session_state.messages) - 1)
+
+                if thinking_agent_enabled():
+                    if is_last_msg and st.session_state.get("thinking_status") == "pending":
+                        st.markdown(
+                            '<div style="color:#9CA3AF;font-size:12px;margin-top:4px;font-style:italic;">Insights…</div>',
+                            unsafe_allow_html=True,
+                        )
+                    elif thinking_result:
+                        th_text = (thinking_result.get("thinking_markdown") or "").strip()
+                        if th_text:
+                            st.markdown(
+                                f'<div style="color:#9CA3AF;font-size:12px;margin-top:4px;font-style:italic;">Insights: {th_text}</div>',
+                                unsafe_allow_html=True,
+                            )
+
 
 # ─────────────────────────────────────────────────────────────
 # CHAT INPUT
@@ -483,6 +488,7 @@ if prompt := st.chat_input(placeholder):
             render_card(listing, i)
 
     # 4. Thinking flow generation (background by default)
+    _sync_thinking_result = None
     if thinking_agent_enabled() and thinking_context is not None:
         st.session_state.last_thinking_payload = thinking_context
         if thinking_agent_background():
@@ -493,9 +499,9 @@ if prompt := st.chat_input(placeholder):
                 thinking_context,
             )
         else:
-            result = _run_thinking_job(st.session_state.chat_session_id, thinking_context)
-            st.session_state.last_thinking_result = result
-            st.session_state.thinking_status = "done" if result.get("status") == "ok" else "error"
+            _sync_thinking_result = _run_thinking_job(st.session_state.chat_session_id, thinking_context)
+            st.session_state.last_thinking_result = _sync_thinking_result
+            st.session_state.thinking_status = "done" if _sync_thinking_result.get("status") == "ok" else "error"
             st.session_state.thinking_future = None
 
     # 5. Async persist to Supabase (non-blocking)
@@ -521,6 +527,8 @@ if prompt := st.chat_input(placeholder):
         "content": response_text,
         "listings": listings or None,
         "user_feedback": None,
+        "thinking_payload": thinking_context if thinking_agent_enabled() and thinking_context is not None else None,
+        "thinking_result": _sync_thinking_result,  # None when background; filled by poll loop
     })
 
     # 7. Rerun to reset widget state — prevents the "send twice" bug.
