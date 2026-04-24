@@ -4,6 +4,7 @@ TrailerPlace AI Assistant — Streamlit frontend.
 Run:
     conda run -n islam360 streamlit run app.py
 """
+import html
 import os
 import secrets
 import time
@@ -20,12 +21,13 @@ from src.log_setup import configure_trailerplace_logging
 
 configure_trailerplace_logging()
 
-from src.agent import TrailerAgent
+from src.agent import TrailerAgent, canonical_listing_key_from_listing
 from src.conversation_store import (
     enqueue_save_turn,
     enqueue_save_user_feedback,
     persistence_enabled,
 )
+from src.shown_listings_store import add_shown_keys
 from src.models import TrailerListing
 from src.thinking_agent import (
     generate_thinking_flow,
@@ -457,8 +459,18 @@ else:
                     elif thinking_result:
                         th_text = (thinking_result.get("thinking_markdown") or "").strip()
                         if th_text:
+                            safe = html.escape(th_text)
                             st.markdown(
-                                f'<div style="color:#9CA3AF;font-size:12px;margin-top:4px;font-style:italic;">Insights: {th_text}</div>',
+                                """
+<div class="trailerplace-insights" style="max-height: min(50vh, 22rem); overflow-y: auto;
+  -webkit-overflow-scrolling: touch; color: #9CA3AF; font-size: 12px; margin-top: 6px; line-height: 1.55;
+  padding: 10px 12px; font-style: italic; background: rgba(0,0,0,0.18); border-radius: 8px;
+  border: 1px solid #374151; box-sizing: border-box; margin-bottom: 8px;">
+  <div style="white-space: pre-wrap; word-wrap: break-word; overflow-wrap: anywhere;">Insights: """
+                                + safe
+                                + """</div>
+</div>
+""",
                                 unsafe_allow_html=True,
                             )
 
@@ -482,7 +494,10 @@ if prompt := st.chat_input(placeholder):
     # 3. Get response — spinner is visible while user bubble is already on screen
     with st.chat_message("assistant"):
         with st.spinner(""):
-            response_text, listings, product_fetch, thinking_context = st.session_state.agent.chat(prompt)
+            response_text, listings, product_fetch, thinking_context = st.session_state.agent.chat(
+                prompt,
+                session_id=st.session_state.get("chat_session_id"),
+            )
         st.markdown(response_text)
         for i, listing in enumerate(listings or [], 1):
             render_card(listing, i)
@@ -504,7 +519,15 @@ if prompt := st.chat_input(placeholder):
             st.session_state.thinking_status = "done" if _sync_thinking_result.get("status") == "ok" else "error"
             st.session_state.thinking_future = None
 
-    # 5. Async persist to Supabase (non-blocking)
+    # 5. Remember listing cards shown this turn (Pinecone "show more" exclude list)
+    sid = st.session_state.get("chat_session_id")
+    if sid and listings:
+        add_shown_keys(
+            sid,
+            [canonical_listing_key_from_listing(x) for x in listings],
+        )
+
+    # 6. Async persist to Supabase (non-blocking)
     if persistence_enabled() and st.session_state.get("chat_session_id"):
         tool_call_db = None
         tool_res_db = None
@@ -521,7 +544,7 @@ if prompt := st.chat_input(placeholder):
             search_runs=product_fetch if product_fetch else None,
         )
 
-    # 6. Persist response
+    # 7. Persist response
     st.session_state.messages.append({
         "role": "assistant",
         "content": response_text,
@@ -531,6 +554,6 @@ if prompt := st.chat_input(placeholder):
         "thinking_result": _sync_thinking_result,  # None when background; filled by poll loop
     })
 
-    # 7. Rerun to reset widget state — prevents the "send twice" bug.
+    # 8. Rerun to reset widget state — prevents the "send twice" bug.
     #    Content is already rendered above so the rerun re-draws from history seamlessly.
     st.rerun()

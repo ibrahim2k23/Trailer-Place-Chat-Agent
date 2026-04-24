@@ -1,6 +1,9 @@
 """
 Conversational trailer recommendation agent.
 Uses OpenAI tool calling to decide when to search vs. ask clarifying questions.
+
+Primary implementation: src/agent.py (Pinecone, show-more / shown_listings_store, session ids).
+This file is kept for prompt/backup experiments; re-sync structural changes from agent.py when needed.
 """
 import json
 import logging
@@ -617,6 +620,14 @@ SEARCH_TOOL = {
                     "description": (
                         "Required haul/load length in feet when the customer clearly provides it "
                         "(for fit-aware ranking). Omit if unknown."
+                    ),
+                },
+                "more_results": {
+                    "type": "boolean",
+                    "description": (
+                        "Set true when the customer wants more inventory for the same search "
+                        "(e.g. 'show me more', 'any others'). Excludes already-shown listings "
+                        "for this chat session. See src/agent.py for full behavior."
                     ),
                 },
             },

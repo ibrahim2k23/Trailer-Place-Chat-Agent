@@ -17,6 +17,7 @@ from pinecone import Pinecone
 
 from src.models import TrailerFilter, TrailerListing
 from src.normalizer import normalize_make, normalize_color, normalize_hitch, normalize_category
+from src.shown_listings_store import load_shown_keys
 
 load_dotenv()
 
@@ -62,6 +63,20 @@ def _canonical_listing_key_from_match(match: dict) -> str:
 
     mid = str(match.get("id", "") or "").strip().lower()
     return f"id:{mid}" if mid else f"fallback:{id(match)}"
+
+
+def canonical_listing_key_from_listing(lst: TrailerListing) -> str:
+    """Same identity rules as `_canonical_listing_key_from_match` (for session JSON and UI)."""
+    return _canonical_listing_key_from_match(
+        {
+            "id": lst.listing_id,
+            "metadata": {
+                "url": lst.url,
+                "title": lst.title,
+                "listing_id": lst.listing_id,
+            },
+        }
+    )
 
 
 def _match_metadata_richness(match: dict) -> int:
@@ -161,6 +176,9 @@ EMBEDDING_MODEL = os.getenv("OPENAI_EMBEDDING_MODEL", "text-embedding-3-small")
 SEARCH_TOP_K = _env_positive_int("SEARCH_TOP_K", 5, minimum=1)
 # Max listings returned to the UI / tool after score-threshold filtering (at least 1)
 SEARCH_MAX_RECOMMENDATIONS = _env_positive_int("SEARCH_MAX_RECOMMENDATIONS", 3, minimum=1)
+# Larger Pinecone top_k when excluding already-shown listing keys (see shown_listings_store).
+SEARCH_TOP_K_MORE = _env_positive_int("SEARCH_TOP_K_MORE", 50, minimum=5, maximum=500)
+SEARCH_TOP_K_MORE_MAX = _env_positive_int("SEARCH_TOP_K_MORE_MAX", 100, minimum=10, maximum=500)
 THINKING_WINDOW_TURNS = _env_positive_int("THINKING_WINDOW_TURNS", 8, minimum=2, maximum=40)
 # Post-ranking thresholds for over-sizing penalties.
 RERANK_WARN_RATIO = _env_positive_float("RERANK_WARN_RATIO", 1.3, minimum=1.0)
@@ -697,6 +715,15 @@ SEARCH_TOOL = {
                         "(for fit-aware filtering/ranking). Omit if unknown."
                     ),
                 },
+                "more_results": {
+                    "type": "boolean",
+                    "description": (
+                        "Set true when the customer wants more inventory for the same search "
+                        "(e.g. 'show me more', 'any others', 'what else do you have'). "
+                        "Keep the same filters and an aligned query; already-shown trailers "
+                        "in this chat session are excluded. Omit or false for a normal new search."
+                    ),
+                },
             },
             "required": ["query"],
         },
@@ -816,6 +843,7 @@ Recovery rules — when a customer doesn't know a slot:
 
 ## SEARCHING & RECOMMENDATIONS
 Once required slots are filled, call search_trailers immediately with a rich query. After results come back:
+- **Show more:** If the customer wants additional options for the *same* need (e.g. "show me more", "any others", "what else is available"), call search_trailers again with **more_results: true** and the **same** filter fields and a query consistent with what they are still looking for. Do not set more_results on the first search for a new topic.
 - Open with a short recap of what they asked for (category, haul, rough weight etc.), then introduce the options.
 - **Hitch type and Pinecone:** The vector database filters on structured fields. If the customer clearly wants a **Bumper Pull** or **Gooseneck** hitch (or phrasing like *gooseneck hitch*, *goose neck*, *bumper pull*, *tag along*), you MUST set tool arg **`hitch_type`** to **`"Bumper Pull"`** or **`"Gooseneck"`** — the free-text `query` alone is not enough. **Brand vs hitch:** the word *Gooseneck* in a model name (e.g. a manufacturer) is not a hitch; when the customer is asking for a *gooseneck hitch* / *gooseneck* in a hitch context, they mean **`hitch_type: "Gooseneck"`**.
 - If customer clearly states the load weight, load length, or a minimum trailer GVWR, you MUST pass them in tool args (`required_payload_lbs`, `required_length_ft`, `required_gvwr_lbs`) as numeric values so recommendation ranking can prefer right-sized trailers.
@@ -905,28 +933,46 @@ class TrailerAgent:
         self._history: list[dict] = [
             {"role": "system", "content": _build_system_prompt()}
         ]
+        self._current_session_id: Optional[str] = None
 
     def _embed(self, text: str) -> list[float]:
         resp = self.openai.embeddings.create(model=EMBEDDING_MODEL, input=[text])
         return resp.data[0].embedding
 
     def _search(
-        self, query: str, trailer_filter: TrailerFilter, top_k: int = 5
+        self,
+        query: str,
+        trailer_filter: TrailerFilter,
+        top_k: int = 5,
+        exclude_keys: Optional[set[str]] = None,
     ) -> tuple[list[TrailerListing], list[dict[str, Any]]]:
         vector = self._embed(query)
         pf = _build_pinecone_filter(trailer_filter)
+        ex = set(exclude_keys) if exclude_keys else set()
         search_attempts: list[dict[str, Any]] = []
 
-        def _one_query(pinecone_filter: Optional[dict], relaxed: bool) -> list[dict]:
+        def _effective_top_k(k: int) -> int:
+            if not ex:
+                return k
+            return min(
+                SEARCH_TOP_K_MORE_MAX,
+                max(SEARCH_TOP_K_MORE, len(ex) + SEARCH_MAX_RECOMMENDATIONS * 2, k),
+            )
+
+        k0 = _effective_top_k(top_k)
+
+        def _one_query(
+            pinecone_filter: Optional[dict], relaxed: bool, tk: int
+        ) -> list[dict]:
             logger.info(
                 "PINECONE_FILTER | phase=%s | top_k=%s | filter=%s",
                 "relaxed" if relaxed else "strict",
-                top_k,
+                tk,
                 json.dumps(pinecone_filter, ensure_ascii=True) if pinecone_filter else "None",
             )
             r = self.pc_index.query(
                 vector=vector,
-                top_k=top_k,
+                top_k=tk,
                 include_metadata=True,
                 filter=pinecone_filter,
             )
@@ -934,7 +980,7 @@ class TrailerAgent:
             attempt = {
                 "phase": "relaxed" if relaxed else "strict",
                 "query": query,
-                "top_k": top_k,
+                "top_k": tk,
                 "pinecone_filter": pinecone_filter,
                 "match_count": len(mlist),
                 "matches": [_match_summary_for_log(x) for x in mlist],
@@ -946,14 +992,54 @@ class TrailerAgent:
             )
             return mlist
 
-        matches = _one_query(pf, False)
-        if not matches and pf:
-            relaxed_f = {
-                k: v for k, v in (pf or {}).items()
-                if k in ("condition", "price", "hitch_type")
-            }
+        def _filter_excluded(raw: list[dict]) -> list[dict]:
+            if not ex:
+                return raw
+            return [m for m in raw if _canonical_listing_key_from_match(m) not in ex]
+
+        relaxed_f: dict = {}
+        f_arg: Optional[dict] = None
+        if pf:
+            relaxed_f = {k: v for k, v in pf.items() if k in ("condition", "price", "hitch_type")}
             f_arg = relaxed_f if relaxed_f else None
-            matches = _one_query(f_arg, True)
+
+        matches: list[dict] = []
+        if not ex:
+            matches = _one_query(pf, False, k0)
+            if not matches and pf:
+                matches = _one_query(f_arg, True, k0)
+        else:
+            steps: list[tuple[Optional[dict], bool, int]] = [
+                (pf, False, k0),
+            ]
+            if pf:
+                steps.append((f_arg, True, k0))
+            steps.append((pf, False, SEARCH_TOP_K_MORE_MAX))
+            if pf:
+                steps.append((f_arg, True, SEARCH_TOP_K_MORE_MAX))
+            for filt, is_relaxed, tk in steps:
+                raw = _one_query(filt, is_relaxed, tk)
+                c = _filter_excluded(raw)
+                logger.info(
+                    "PINECONE_EXCLUDE | raw_matches=%s | after_exclusion=%s | "
+                    "exclude_set_size=%s | step_top_k=%s | relaxed=%s",
+                    len(raw),
+                    len(c),
+                    len(ex),
+                    tk,
+                    is_relaxed,
+                )
+                if c:
+                    matches = c
+                    break
+            else:
+                matches = []
+        if ex:
+            logger.info(
+                "PINECONE_EXCLUDE | final_pre_dedupe_count=%s | exclude_set_size=%s",
+                len(matches),
+                len(ex),
+            )
 
         deduped_matches, dedupe_debug = _dedupe_matches(matches)
         if dedupe_debug.get("dropped_count", 0) > 0:
@@ -964,6 +1050,13 @@ class TrailerAgent:
                 dedupe_debug["dropped_count"],
             )
         search_attempts.append({"dedupe": dedupe_debug})
+        search_attempts.append(
+            {
+                "exclude_shown": bool(ex),
+                "exclude_set_size": len(ex),
+                "candidates_pre_dedupe": len(matches),
+            }
+        )
         return [_metadata_to_listing(m) for m in deduped_matches], search_attempts
 
     @staticmethod
@@ -1308,6 +1401,7 @@ class TrailerAgent:
         self, tool_call,
     ) -> tuple[str, list[TrailerListing], dict[str, Any], list[dict[str, Any]] | None]:
         args = json.loads(tool_call.function.arguments)
+        more_results = bool(args.pop("more_results", False))
         query = args.pop("query")
         required_payload_lbs = _coerce_required_payload_lbs(args.pop("required_payload_lbs", None))
         required_length_ft = _coerce_required_length_ft(args.pop("required_length_ft", None))
@@ -1412,7 +1506,18 @@ class TrailerAgent:
         if normalized_fragments:
             query_for_search = f"{query} | normalized_requirements: {' '.join(normalized_fragments)}"
 
-        listings, search_attempts = self._search(query_for_search, trailer_filter, top_k=SEARCH_TOP_K)
+        exclude_keys: Optional[set[str]] = None
+        if more_results:
+            if self._current_session_id:
+                exclude_keys = load_shown_keys(self._current_session_id)
+            else:
+                logger.warning(
+                    "search_trailers more_results=True but no session_id; skipping exclude-shown"
+                )
+
+        listings, search_attempts = self._search(
+            query_for_search, trailer_filter, top_k=SEARCH_TOP_K, exclude_keys=exclude_keys
+        )
         logger.info(
             "RERANK_INPUT | payload_lbs=%s | length_ft=%s | gvwr_lbs=%s | source=%s",
             required_payload_lbs,
@@ -1475,6 +1580,8 @@ class TrailerAgent:
         tool_debug: dict[str, Any] = {
             "query": query,
             "query_for_search": query_for_search,
+            "more_results": more_results,
+            "excluded_stored_count": len(exclude_keys) if exclude_keys else 0,
             "trailer_filter": tfilter,
             "hitch_type": hitch_type,
             "hitch_type_source": hitch_type_source,
@@ -1526,7 +1633,7 @@ class TrailerAgent:
         return compact[-max_turns:]
 
     def chat(
-        self, user_message: str
+        self, user_message: str, session_id: Optional[str] = None
     ) -> tuple[str, list[TrailerListing], list[dict[str, Any]], dict[str, Any] | None]:
         """
         Process a user message and return
@@ -1534,63 +1641,69 @@ class TrailerAgent:
         `product_fetch_debug` is a list of tool-call debug dicts (one per search_trailers
         in this user turn), empty if no search ran.
         `thinking_context` is a compact payload for the thinking explainer.
+        Pass `session_id` (e.g. Streamlit chat UUID) so search_trailers with more_results
+        can exclude listings already shown in this session.
         """
+        self._current_session_id = session_id
         self._history.append({"role": "user", "content": user_message})
 
         returned_listings: list[TrailerListing] = []
         product_fetch_per_tool: list[dict[str, Any]] = []
 
-        while True:
-            response = self.openai.chat.completions.create(
-                model=OPENAI_MODEL,
-                messages=self._history,
-                tools=[SEARCH_TOOL],
-                tool_choice="auto",
-            )
-
-            msg = response.choices[0].message
-
-            # No tool call → direct response
-            if not msg.tool_calls:
-                text = msg.content or ""
-                self._history.append({"role": "assistant", "content": text})
-                thinking_context = {
-                    "user_message": user_message,
-                    "assistant_message": text,
-                    "conversation_window": self._thinking_conversation_window(),
-                    "tool_runs": product_fetch_per_tool,
-                    "selected_recommendations": [
-                        {
-                            "rank": i,
-                            "listing_id": lst.listing_id,
-                            "title": lst.title,
-                            "length": lst.length,
-                            "payload_capacity": lst.payload_capacity,
-                            "gvwr": lst.gvwr,
-                            "price_display": lst.price_display,
-                            "url": lst.url,
-                            "relevance_score": lst.score,
-                        }
-                        for i, lst in enumerate(returned_listings, 1)
-                    ],
-                }
-                return text, returned_listings, product_fetch_per_tool, thinking_context
-
-            # Tool call
-            self._history.append(msg)
-
-            for tool_call in msg.tool_calls:
-                tool_result, listings, tool_debug, result_for_db = self._execute_tool_call(
-                    tool_call
+        try:
+            while True:
+                response = self.openai.chat.completions.create(
+                    model=OPENAI_MODEL,
+                    messages=self._history,
+                    tools=[SEARCH_TOOL],
+                    tool_choice="auto",
                 )
-                product_fetch_per_tool.append(tool_debug)
-                if listings:
-                    returned_listings = listings[:SEARCH_MAX_RECOMMENDATIONS]
 
-                self._history.append({
-                    "role": "tool",
-                    "tool_call_id": tool_call.id,
-                    "content": tool_result,
-                })
+                msg = response.choices[0].message
 
-            # Loop back to get the final text response after tool results
+                # No tool call → direct response
+                if not msg.tool_calls:
+                    text = msg.content or ""
+                    self._history.append({"role": "assistant", "content": text})
+                    thinking_context = {
+                        "user_message": user_message,
+                        "assistant_message": text,
+                        "conversation_window": self._thinking_conversation_window(),
+                        "tool_runs": product_fetch_per_tool,
+                        "selected_recommendations": [
+                            {
+                                "rank": i,
+                                "listing_id": lst.listing_id,
+                                "title": lst.title,
+                                "length": lst.length,
+                                "payload_capacity": lst.payload_capacity,
+                                "gvwr": lst.gvwr,
+                                "price_display": lst.price_display,
+                                "url": lst.url,
+                                "relevance_score": lst.score,
+                            }
+                            for i, lst in enumerate(returned_listings, 1)
+                        ],
+                    }
+                    return text, returned_listings, product_fetch_per_tool, thinking_context
+
+                # Tool call
+                self._history.append(msg)
+
+                for tool_call in msg.tool_calls:
+                    tool_result, listings, tool_debug, result_for_db = self._execute_tool_call(
+                        tool_call
+                    )
+                    product_fetch_per_tool.append(tool_debug)
+                    if listings:
+                        returned_listings = listings[:SEARCH_MAX_RECOMMENDATIONS]
+
+                    self._history.append({
+                        "role": "tool",
+                        "tool_call_id": tool_call.id,
+                        "content": tool_result,
+                    })
+
+                # Loop back to get the final text response after tool results
+        finally:
+            self._current_session_id = None

@@ -17,3 +17,6 @@ __pycache__/
 .claude/
 
 thinking_log/
+
+# Per-session "already shown" listing keys (Pinecone show-more)
+shown_listings/
